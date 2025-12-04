@@ -70,7 +70,7 @@ func stripMarkdown(md string) string {
 
 func chunkText(text string, maxChars int) []string {
 	if maxChars <= 0 {
-		maxChars = 6000
+		maxChars = 4000
 	}
 	paras := strings.Split(text, "\n\n")
 	chunks := make([]string, 0)
@@ -95,7 +95,7 @@ func chunkText(text string, maxChars int) []string {
 
 		paraLen := len(para)
 		if paraLen > maxChars {
-			sentences := regexp.MustCompile(`(?<=[.!?])\s+`).Split(para, -1)
+			sentences := regexp.MustCompile(`[.!?]\s+`).Split(para, -1)
 			buf := make([]string, 0)
 			bufLen := 0
 			for _, s := range sentences {
@@ -197,7 +197,7 @@ func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(
 		return jobResult{Status: jobEmpty}
 	}
 
-	chunks := chunkText(plain, 6000)
+	chunks := chunkText(plain, 4000)
 	if len(chunks) == 0 {
 		return jobResult{Status: jobEmpty}
 	}
@@ -206,21 +206,24 @@ func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(
 		return jobResult{Status: jobFailed, Err: err}
 	}
 
-	f, err := os.Create(job.DestPath)
-	if err != nil {
-		return jobResult{Status: jobFailed, Err: err}
-	}
-	defer f.Close()
-
 	client := &http.Client{Timeout: 90 * time.Second}
 
+	totalChunks := len(chunks)
+	if progress != nil {
+		progress(0, totalChunks)
+	}
+	var buf bytes.Buffer
 	for idx, chunk := range chunks {
 		if progress != nil {
-			progress(idx+1, len(chunks))
+			progress(idx+1, totalChunks)
 		}
-		if err := callTTS(ctx, client, cfg, chunk, f); err != nil {
-			return jobResult{Status: jobFailed, Chunks: len(chunks), Err: err}
+		if err := callTTS(ctx, client, cfg, chunk, &buf); err != nil {
+			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
 		}
+	}
+
+	if err := os.WriteFile(job.DestPath, buf.Bytes(), 0o644); err != nil {
+		return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
 	}
 
 	return jobResult{Status: jobDone, Chunks: len(chunks)}
@@ -249,12 +252,45 @@ func callTTS(ctx context.Context, client *http.Client, cfg appConfig, chunk stri
 		return err
 	}
 
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt*attempt) * 300 * time.Millisecond)
+		}
+
+		if err := doTTSRequest(ctx, client, cfg.APIKey, body, w); err != nil {
+			lastErr = err
+			var apiErr *apiError
+			if errors.As(err, &apiErr) && apiErr.retryable {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("unknown TTS error")
+}
+
+type apiError struct {
+	status    string
+	message   string
+	retryable bool
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("%s: %s", e.status, e.message)
+}
+
+func doTTSRequest(ctx context.Context, client *http.Client, apiKey string, body []byte, w io.Writer) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/audio/speech", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -264,7 +300,8 @@ func callTTS(ctx context.Context, client *http.Client, cfg appConfig, chunk stri
 
 	if resp.StatusCode >= 400 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("tts request failed: %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		retryable := resp.StatusCode == 429 || resp.StatusCode >= 500
+		return &apiError{status: resp.Status, message: strings.TrimSpace(string(snippet)), retryable: retryable}
 	}
 
 	_, err = io.Copy(w, resp.Body)

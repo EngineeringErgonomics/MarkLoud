@@ -32,3 +32,4 @@ go.work.sum
 # .idea/
 # .vscode/
 /.idea/
+/logs/.a468925137bd09d7d726ba7837d6d107bc457a3e-audit.json

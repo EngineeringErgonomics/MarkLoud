@@ -7,7 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -49,6 +52,8 @@ type chunkMsg struct {
 	job   fileJob
 	idx   int
 	total int
+	done  bool
+	err   error
 }
 
 type allDoneMsg struct{}
@@ -66,11 +71,25 @@ type model struct {
 	currentIdx   int
 	summary      summaryCounts
 	currentChunk string
+	lastError    string
 
 	workerSem chan struct{}
 	chunkCh   chan chunkMsg
+	tasks     map[string]taskStatus
+
+	logFile *os.File
+	logPath string
+	logMu   sync.Mutex
 
 	spin spinner.Model
+}
+
+type taskStatus struct {
+	name   string
+	idx    int
+	total  int
+	status string
+	err    error
 }
 
 func initialModel() model {
@@ -109,6 +128,7 @@ func initialModel() model {
 		message:    "",
 		err:        nil,
 		spin:       spin,
+		tasks:      make(map[string]taskStatus),
 	}
 }
 
@@ -134,13 +154,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentIdx = 0
 		m.summary = summaryCounts{}
 		m.currentChunk = "waiting…"
+		m.lastError = ""
+		m.tasks = make(map[string]taskStatus)
 
 		workers := runtime.NumCPU() - 2
 		if workers < 1 {
 			workers = 1
 		}
+		if workers > 4 {
+			workers = 4
+		}
 		m.workerSem = make(chan struct{}, workers)
-		m.chunkCh = make(chan chunkMsg)
+		m.chunkCh = make(chan chunkMsg, 100)
 
 		cmds := []tea.Cmd{m.spin.Tick, listenChunks(m.chunkCh)}
 		for idx, job := range msg.jobs {
@@ -159,16 +184,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case allDoneMsg:
-		if m.chunkCh != nil {
-			close(m.chunkCh)
-			m.chunkCh = nil
-		}
 		m.state = stateDone
 		m.message = "Conversion finished."
+		if m.logFile != nil {
+			fmt.Fprintf(m.logFile, "=== run finished %s ===\n", time.Now().Format(time.RFC3339))
+			m.logFile.Close()
+			m.logFile = nil
+		}
 		return m, nil
 	case chunkMsg:
+		key := msg.job.RelPath
+		ts := m.tasks[key]
+		ts.name = key
+		ts.idx = msg.idx
+		ts.total = msg.total
+		if msg.done {
+			if msg.err != nil {
+				ts.status = "error"
+				ts.err = msg.err
+				m.lastError = msg.err.Error()
+			} else {
+				ts.status = "done"
+			}
+		} else {
+			ts.status = "running"
+		}
+		m.tasks[key] = ts
+
 		m.currentChunk = fmt.Sprintf("%s (%d/%d)", msg.job.RelPath, msg.idx, msg.total)
-		return m, listenChunks(m.chunkCh)
+		// Only re-listen if still running (prevents goroutine leak after completion)
+		if m.state == stateRunning {
+			return m, listenChunks(m.chunkCh)
+		}
+		return m, nil
 	case spinner.TickMsg:
 		if m.state == stateRunning {
 			var cmd tea.Cmd
@@ -199,8 +247,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
-		case " ":
-			// space toggles overwrite
+		case "o":
+			// 'o' toggles overwrite
 			m.overwrite = !m.overwrite
 			return m, nil
 		case "enter":
@@ -261,6 +309,18 @@ func (m model) startConversion() (tea.Model, tea.Cmd) {
 	root := strings.TrimSpace(m.inputs[0].Value())
 	out := strings.TrimSpace(m.inputs[1].Value())
 	voice := strings.TrimSpace(m.inputs[2].Value())
+	if voice == "" {
+		voice = "alloy"
+	}
+
+	cwd, _ := os.Getwd()
+	logPath := filepath.Join(cwd, "markloud_errors.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		m.err = fmt.Errorf("failed to open log file: %w", err)
+		return m, nil
+	}
+	fmt.Fprintf(logFile, "\n=== MarkLoud run %s ===\n", time.Now().Format(time.RFC3339))
 
 	cfg := appConfig{
 		Root:           root,
@@ -277,6 +337,8 @@ func (m model) startConversion() (tea.Model, tea.Cmd) {
 
 	m.err = nil
 	m.message = "Preparing files…"
+	m.logFile = logFile
+	m.logPath = logPath
 	return m, prepareConversionCmd(cfg)
 }
 
@@ -309,6 +371,7 @@ func runJobCmd(cfg appConfig, job fileJob, idx int, sem chan struct{}, chunkCh c
 		res := processFile(ctx, job, cfg, func(cur, total int) {
 			chunkCh <- chunkMsg{job: job, idx: cur, total: total}
 		})
+		chunkCh <- chunkMsg{job: job, idx: res.Chunks, total: res.Chunks, done: true, err: res.Err}
 		return fileDoneMsg{idx: idx, res: res, job: job}
 	}
 }
@@ -324,21 +387,31 @@ func listenChunks(ch <-chan chunkMsg) tea.Cmd {
 }
 
 func (m *model) applyResult(msg fileDoneMsg) {
+	ts := m.tasks[msg.job.RelPath]
+	ts.name = msg.job.RelPath
 	switch msg.res.Status {
 	case jobDone:
 		m.summary.Done++
+		ts.status = "done"
 	case jobSkipped:
 		m.summary.Skipped++
 		m.currentChunk = fmt.Sprintf("%s (skipped)", msg.job.RelPath)
+		ts.status = "skipped"
 	case jobEmpty:
 		m.summary.Empty++
 		m.currentChunk = fmt.Sprintf("%s (empty)", msg.job.RelPath)
+		ts.status = "empty"
 	case jobFailed:
 		m.summary.Failed++
+		ts.status = "error"
+		ts.err = msg.res.Err
 	}
+	m.tasks[msg.job.RelPath] = ts
 	m.currentIdx++
 	if msg.res.Err != nil {
 		m.currentChunk = fmt.Sprintf("%s (error)", msg.job.RelPath)
+		m.lastError = msg.res.Err.Error()
+		m.logf("ERROR %s: %v\n", msg.job.RelPath, msg.res.Err)
 	}
 }
 
@@ -380,7 +453,7 @@ func (m model) viewConfig() string {
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Output directory"), m.inputs[1].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Voice"), m.inputs[2].View()),
-		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite existing [space]:"), boolBadge(m.overwrite)),
+		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite existing [o]:"), boolBadge(m.overwrite)),
 	}
 
 	if m.err != nil {
@@ -390,7 +463,7 @@ func (m model) viewConfig() string {
 		rows = append(rows, dimStyle.Render(m.message))
 	}
 
-	rows = append(rows, dimStyle.Render("tab/shift+tab to move · enter to start · space to toggle overwrite · q to quit"))
+	rows = append(rows, dimStyle.Render("tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }
@@ -407,6 +480,69 @@ func boolBadge(v bool) string {
 		return successStyle.Render("ON")
 	}
 	return dimStyle.Render("off")
+}
+
+func (m model) renderActive() []string {
+	lines := []string{}
+	names := make([]string, 0, len(m.tasks))
+	for k := range m.tasks {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for i, name := range names {
+		if i >= 6 {
+			break
+		}
+		ts := m.tasks[name]
+		progress := progressBar(ts.idx, ts.total, 24)
+		state := ""
+		switch ts.status {
+		case "running":
+			state = dimStyle.Render("running")
+		case "done":
+			state = successStyle.Render("done")
+		case "error":
+			state = errorStyle.Render("error (see log)")
+		case "skipped":
+			state = dimStyle.Render("skipped")
+		case "empty":
+			state = dimStyle.Render("empty")
+		}
+		line := fmt.Sprintf("%s %s %s %s", valueStyle.Render("•"), progress, valueStyle.Render(ts.name), labelStyle.Render(state))
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func progressBar(cur, total, width int) string {
+	if total <= 0 {
+		total = 1
+	}
+	if width < 4 {
+		width = 4
+	}
+	ratio := float64(cur) / float64(total)
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	filled := int(ratio * float64(width))
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return valueStyle.Render("[" + bar + fmt.Sprintf(" %d/%d]", cur, total))
+}
+
+func (m *model) logf(format string, args ...any) {
+	if m.logFile == nil {
+		return
+	}
+	m.logMu.Lock()
+	defer m.logMu.Unlock()
+	fmt.Fprintf(m.logFile, format, args...)
 }
 
 func (m model) viewRunning() string {
@@ -426,9 +562,22 @@ func (m model) viewRunning() string {
 		bar,
 		summary,
 		"",
-		labelStyle.Render("Current chunk:"),
+		labelStyle.Render("Active files:"),
 	}
-	lines = append(lines, valueStyle.Render(m.currentChunk))
+
+	active := m.renderActive()
+	if len(active) == 0 {
+		lines = append(lines, dimStyle.Render("waiting for work…"))
+	} else {
+		lines = append(lines, active...)
+	}
+
+	if m.lastError != "" {
+		lines = append(lines, "", errorStyle.Render("Last error (see log)"))
+	}
+	if m.logPath != "" {
+		lines = append(lines, dimStyle.Render("Log: "+m.logPath))
+	}
 
 	lines = append(lines, "", dimStyle.Render("ctrl+c or q to abort"))
 	return boxStyle.Width(76).Render(strings.Join(lines, "\n"))

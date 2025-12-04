@@ -23,6 +23,8 @@ Markdown → AAC in a Bubble Tea TUI powered by OpenAI’s tts-1-hd-1106 model.
 - Writes `.aac` files that mirror the source tree inside your output directory.
 - Idempotent by default: existing audio is skipped unless you toggle **Overwrite** (spacebar) in the TUI.
 - Uses a worker pool (`num CPU cores - 2`, min 1) for parallel file conversion.
+- Live UI shows parallel file progress bars and last error (if any) without dumping text content.
+- Errors are also written to `markloud_errors.log` in the current working directory for post-run inspection.
 
 ## Keys inside the TUI
 - `tab` / `shift+tab` — move between inputs  
