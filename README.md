@@ -22,11 +22,12 @@ Markdown → AAC in a Bubble Tea TUI powered by OpenAI’s tts-1-hd-1106 model.
 - Strips light Markdown syntax, chunks text to ~6k characters, and streams each chunk to OpenAI TTS (`tts-1-hd-1106`) with `response_format=aac`.
 - Writes `.aac` files that mirror the source tree inside your output directory.
 - Idempotent by default: existing audio is skipped unless you toggle **Overwrite** (spacebar) in the TUI.
+- Uses a worker pool (`num CPU cores - 2`, min 1) for parallel file conversion.
 
 ## Keys inside the TUI
-- `tab` / `shift+tab` — move between inputs
-- `enter` — start conversion
-- `space` — toggle overwrite
+- `tab` / `shift+tab` — move between inputs  
+- `enter` — start conversion  
+- `space` — toggle overwrite  
 - `q` or `ctrl+c` — quit
 
 ## Notes
