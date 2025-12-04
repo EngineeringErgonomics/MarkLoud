@@ -94,8 +94,6 @@ type taskStatus struct {
 }
 
 func initialModel() model {
-	_ = godotenv.Load()
-
 	tiRoot := textinput.New()
 	tiRoot.Placeholder = "./notes"
 	tiRoot.SetValue(".")
@@ -614,9 +612,98 @@ func (m model) viewError() string {
 }
 
 func main() {
+	_ = godotenv.Load()
+
+	// CLI flags
+	inputDir := flag.String("i", "", "Input directory containing markdown files")
+	outputDir := flag.String("o", "", "Output directory for audio files")
+	voice := flag.String("voice", envOr("OPENAI_TTS_VOICE", "alloy"), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
+	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
+	flag.Parse()
+
+	// Non-interactive mode if input is provided
+	if *inputDir != "" {
+		if *outputDir == "" {
+			*outputDir = "./audio_out"
+		}
+		runNonInteractive(*inputDir, *outputDir, *voice, *overwrite)
+		return
+	}
+
+	// Interactive TUI mode
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Println("error:", err)
+		os.Exit(1)
+	}
+}
+
+func runNonInteractive(inputDir, outputDir, voice string, overwrite bool) {
+	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "error: OPENAI_API_KEY is not set")
+		os.Exit(1)
+	}
+
+	info, err := os.Stat(inputDir)
+	if err != nil || !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "error: input directory not found: %s\n", inputDir)
+		os.Exit(1)
+	}
+
+	cfg := appConfig{
+		Root:           inputDir,
+		Out:            outputDir,
+		Voice:          voice,
+		Model:          "tts-1-hd-1106",
+		ResponseFormat: "aac",
+		Speed:          1.0,
+		Overwrite:      overwrite,
+		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
+		APIKey:         apiKey,
+		Pattern:        "*.md",
+	}
+
+	jobs, err := collectMarkdownFiles(cfg.Root, cfg.Out, cfg.Pattern, cfg.ResponseFormat)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if len(jobs) == 0 {
+		fmt.Fprintf(os.Stderr, "error: no markdown files matching %s\n", cfg.Pattern)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Processing %d file(s)...\n", len(jobs))
+
+	var done, skipped, empty, failed int
+	ctx := context.Background()
+
+	for _, job := range jobs {
+		fmt.Printf("  %s ", job.RelPath)
+		res := processFile(ctx, job, cfg, func(cur, total int) {
+			// Progress callback - print dots
+			fmt.Print(".")
+		})
+
+		switch res.Status {
+		case jobDone:
+			done++
+			fmt.Println(" done")
+		case jobSkipped:
+			skipped++
+			fmt.Println(" skipped")
+		case jobEmpty:
+			empty++
+			fmt.Println(" empty")
+		case jobFailed:
+			failed++
+			fmt.Printf(" error: %v\n", res.Err)
+		}
+	}
+
+	fmt.Printf("\nComplete: %d done, %d skipped, %d empty, %d failed\n", done, skipped, empty, failed)
+	if failed > 0 {
 		os.Exit(1)
 	}
 }
