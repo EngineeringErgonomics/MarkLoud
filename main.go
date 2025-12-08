@@ -59,6 +59,13 @@ type chunkMsg struct {
 
 type allDoneMsg struct{}
 
+type cliOptions struct {
+	inputDir  string
+	outputDir string
+	voice     string
+	overwrite bool
+}
+
 type model struct {
 	state      appState
 	inputs     []textinput.Model
@@ -83,6 +90,10 @@ type model struct {
 	logMu   sync.Mutex
 
 	spin spinner.Model
+
+	// CLI mode - skip config screen and auto-quit on completion
+	cliMode bool
+	cliOpts *cliOptions
 }
 
 type taskStatus struct {
@@ -93,7 +104,7 @@ type taskStatus struct {
 	err    error
 }
 
-func initialModel() model {
+func initialModel(opts *cliOptions) model {
 	tiRoot := textinput.New()
 	tiRoot.Placeholder = "./notes"
 	tiRoot.SetValue(".")
@@ -119,7 +130,7 @@ func initialModel() model {
 	spin := spinner.New()
 	spin.Spinner = spinner.Points
 
-	return model{
+	m := model{
 		state:      stateConfig,
 		inputs:     inputs,
 		focusIndex: 0,
@@ -129,6 +140,18 @@ func initialModel() model {
 		spin:       spin,
 		tasks:      make(map[string]taskStatus),
 	}
+
+	// CLI mode: pre-fill inputs and mark for auto-start
+	if opts != nil {
+		m.cliMode = true
+		m.cliOpts = opts
+		m.inputs[0].SetValue(opts.inputDir)
+		m.inputs[1].SetValue(opts.outputDir)
+		m.inputs[2].SetValue(opts.voice)
+		m.overwrite = opts.overwrite
+	}
+
+	return m
 }
 
 func envOr(key, fallback string) string {
@@ -139,7 +162,35 @@ func envOr(key, fallback string) string {
 }
 
 func (m model) Init() tea.Cmd {
+	if m.cliMode {
+		// Auto-start conversion in CLI mode
+		return m.startConversionCmd()
+	}
 	return textinput.Blink
+}
+
+func (m model) startConversionCmd() tea.Cmd {
+	root := strings.TrimSpace(m.inputs[0].Value())
+	out := strings.TrimSpace(m.inputs[1].Value())
+	voice := strings.TrimSpace(m.inputs[2].Value())
+	if voice == "" {
+		voice = "alloy"
+	}
+
+	cfg := appConfig{
+		Root:           root,
+		Out:            out,
+		Voice:          voice,
+		Model:          "tts-1-hd-1106",
+		ResponseFormat: "aac",
+		Speed:          1.0,
+		Overwrite:      m.overwrite,
+		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
+		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		Pattern:        "*.md",
+	}
+
+	return prepareConversionCmd(cfg)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -156,12 +207,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastError = ""
 		m.tasks = make(map[string]taskStatus)
 
+		// Set up error log file if not already set
+		if m.logFile == nil {
+			cwd, _ := os.Getwd()
+			logPath := filepath.Join(cwd, "logs", "markloud_errors.log")
+			_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+			if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+				m.logFile = logFile
+				m.logPath = logPath
+				fmt.Fprintf(logFile, "\n=== MarkLoud run %s ===\n", time.Now().Format(time.RFC3339))
+			}
+		}
+
 		workers := runtime.NumCPU() - 2
 		if workers < 1 {
 			workers = 1
-		}
-		if workers > 4 {
-			workers = 4
 		}
 		m.workerSem = make(chan struct{}, workers)
 		m.chunkCh = make(chan chunkMsg, 100)
@@ -172,9 +232,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 	case prepareFailedMsg:
-		m.state = stateConfig
 		m.err = msg.err
 		m.message = ""
+		// In CLI mode, show error and quit
+		if m.cliMode {
+			m.state = stateError
+			return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return tea.Quit() })
+		}
+		m.state = stateConfig
 		return m, nil
 	case fileDoneMsg:
 		m.applyResult(msg)
@@ -189,6 +254,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fmt.Fprintf(m.logFile, "=== run finished %s ===\n", time.Now().Format(time.RFC3339))
 			m.logFile.Close()
 			m.logFile = nil
+		}
+		// Auto-quit in CLI mode after brief display
+		if m.cliMode {
+			return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return tea.Quit() })
 		}
 		return m, nil
 	case chunkMsg:
@@ -595,8 +664,8 @@ func (m model) viewDone() string {
 		"",
 		emphStyle.Render("Press enter to run again, q to quit."),
 	}
-	if m.summary.Failed > 0 {
-		lines = append(lines, errorStyle.Render("Check logs above for failed files."))
+	if m.summary.Failed > 0 && m.logPath != "" {
+		lines = append(lines, errorStyle.Render("Errors logged to: "+m.logPath))
 	}
 	return boxStyle.Width(76).Render(strings.Join(lines, "\n"))
 }
@@ -621,89 +690,22 @@ func main() {
 	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
 	flag.Parse()
 
-	// Non-interactive mode if input is provided
+	var opts *cliOptions
 	if *inputDir != "" {
 		if *outputDir == "" {
 			*outputDir = "./audio_out"
 		}
-		runNonInteractive(*inputDir, *outputDir, *voice, *overwrite)
-		return
-	}
-
-	// Interactive TUI mode
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Println("error:", err)
-		os.Exit(1)
-	}
-}
-
-func runNonInteractive(inputDir, outputDir, voice string, overwrite bool) {
-	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: OPENAI_API_KEY is not set")
-		os.Exit(1)
-	}
-
-	info, err := os.Stat(inputDir)
-	if err != nil || !info.IsDir() {
-		fmt.Fprintf(os.Stderr, "error: input directory not found: %s\n", inputDir)
-		os.Exit(1)
-	}
-
-	cfg := appConfig{
-		Root:           inputDir,
-		Out:            outputDir,
-		Voice:          voice,
-		Model:          "tts-1-hd-1106",
-		ResponseFormat: "aac",
-		Speed:          1.0,
-		Overwrite:      overwrite,
-		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
-		APIKey:         apiKey,
-		Pattern:        "*.md",
-	}
-
-	jobs, err := collectMarkdownFiles(cfg.Root, cfg.Out, cfg.Pattern, cfg.ResponseFormat)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-	if len(jobs) == 0 {
-		fmt.Fprintf(os.Stderr, "error: no markdown files matching %s\n", cfg.Pattern)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Processing %d file(s)...\n", len(jobs))
-
-	var done, skipped, empty, failed int
-	ctx := context.Background()
-
-	for _, job := range jobs {
-		fmt.Printf("  %s ", job.RelPath)
-		res := processFile(ctx, job, cfg, func(cur, total int) {
-			// Progress callback - print dots
-			fmt.Print(".")
-		})
-
-		switch res.Status {
-		case jobDone:
-			done++
-			fmt.Println(" done")
-		case jobSkipped:
-			skipped++
-			fmt.Println(" skipped")
-		case jobEmpty:
-			empty++
-			fmt.Println(" empty")
-		case jobFailed:
-			failed++
-			fmt.Printf(" error: %v\n", res.Err)
+		opts = &cliOptions{
+			inputDir:  *inputDir,
+			outputDir: *outputDir,
+			voice:     *voice,
+			overwrite: *overwrite,
 		}
 	}
 
-	fmt.Printf("\nComplete: %d done, %d skipped, %d empty, %d failed\n", done, skipped, empty, failed)
-	if failed > 0 {
+	p := tea.NewProgram(initialModel(opts), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Println("error:", err)
 		os.Exit(1)
 	}
 }
