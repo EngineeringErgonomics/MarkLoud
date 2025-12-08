@@ -49,6 +49,26 @@ type jobResult struct {
 	Err    error
 }
 
+// TTSClient abstracts the text-to-speech provider so we can swap in a mock during tests.
+type TTSClient interface {
+	Synthesize(ctx context.Context, cfg appConfig, chunk string) ([]byte, error)
+}
+
+type openAIClient struct {
+	httpClient *http.Client
+}
+
+var (
+	defaultHTTPClient           = &http.Client{Timeout: 90 * time.Second}
+	ttsClient         TTSClient = &openAIClient{httpClient: defaultHTTPClient}
+)
+
+func setTTSClient(c TTSClient) {
+	if c != nil {
+		ttsClient = c
+	}
+}
+
 var (
 	codeFenceRe    = regexp.MustCompile("(?s)```.*?```")
 	inlineCodeRe   = regexp.MustCompile("`([^`]*)`")
@@ -206,8 +226,6 @@ func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(
 		return jobResult{Status: jobFailed, Err: err}
 	}
 
-	client := &http.Client{Timeout: 90 * time.Second}
-
 	totalChunks := len(chunks)
 	if progress != nil {
 		progress(0, totalChunks)
@@ -217,7 +235,14 @@ func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(
 		if progress != nil {
 			progress(idx+1, totalChunks)
 		}
-		if err := callTTS(ctx, client, cfg, chunk, &buf); err != nil {
+		if ttsClient == nil {
+			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: errors.New("tts client not configured")}
+		}
+		chunkAudio, err := ttsClient.Synthesize(ctx, cfg, chunk)
+		if err != nil {
+			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
+		}
+		if _, err := buf.Write(chunkAudio); err != nil {
 			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
 		}
 	}
@@ -229,9 +254,12 @@ func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(
 	return jobResult{Status: jobDone, Chunks: len(chunks)}
 }
 
-func callTTS(ctx context.Context, client *http.Client, cfg appConfig, chunk string, w io.Writer) error {
+func (c *openAIClient) Synthesize(ctx context.Context, cfg appConfig, chunk string) ([]byte, error) {
 	if cfg.APIKey == "" {
-		return errors.New("OPENAI_API_KEY is missing")
+		return nil, errors.New("OPENAI_API_KEY is missing")
+	}
+	if c.httpClient == nil {
+		c.httpClient = defaultHTTPClient
 	}
 
 	payload := map[string]any{
@@ -249,7 +277,7 @@ func callTTS(ctx context.Context, client *http.Client, cfg appConfig, chunk stri
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var lastErr error
@@ -258,20 +286,21 @@ func callTTS(ctx context.Context, client *http.Client, cfg appConfig, chunk stri
 			time.Sleep(time.Duration(attempt*attempt) * 300 * time.Millisecond)
 		}
 
-		if err := doTTSRequest(ctx, client, cfg.APIKey, body, w); err != nil {
+		var buf bytes.Buffer
+		if err := doTTSRequest(ctx, c.httpClient, cfg.APIKey, body, &buf); err != nil {
 			lastErr = err
 			var apiErr *apiError
 			if errors.As(err, &apiErr) && apiErr.retryable {
 				continue
 			}
-			return err
+			return nil, err
 		}
-		return nil
+		return buf.Bytes(), nil
 	}
 	if lastErr != nil {
-		return lastErr
+		return nil, lastErr
 	}
-	return errors.New("unknown TTS error")
+	return nil, errors.New("unknown TTS error")
 }
 
 type apiError struct {

@@ -104,7 +104,7 @@ type taskStatus struct {
 	err    error
 }
 
-func initialModel(opts *cliOptions) model {
+func initialModel(opts *cliOptions) *model {
 	tiRoot := textinput.New()
 	tiRoot.Placeholder = "./notes"
 	tiRoot.SetValue(".")
@@ -130,7 +130,7 @@ func initialModel(opts *cliOptions) model {
 	spin := spinner.New()
 	spin.Spinner = spinner.Points
 
-	m := model{
+	m := &model{
 		state:      stateConfig,
 		inputs:     inputs,
 		focusIndex: 0,
@@ -161,7 +161,7 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func (m model) Init() tea.Cmd {
+func (m *model) Init() tea.Cmd {
 	if m.cliMode {
 		// Auto-start conversion in CLI mode
 		return m.startConversionCmd()
@@ -169,7 +169,7 @@ func (m model) Init() tea.Cmd {
 	return textinput.Blink
 }
 
-func (m model) startConversionCmd() tea.Cmd {
+func (m *model) startConversionCmd() tea.Cmd {
 	root := strings.TrimSpace(m.inputs[0].Value())
 	out := strings.TrimSpace(m.inputs[1].Value())
 	voice := strings.TrimSpace(m.inputs[2].Value())
@@ -193,7 +193,7 @@ func (m model) startConversionCmd() tea.Cmd {
 	return prepareConversionCmd(cfg)
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -295,7 +295,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m.updateInputs(msg)
 }
 
-func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.state {
 	case stateConfig:
 		switch msg.String() {
@@ -343,7 +343,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) updateInputs(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateInputs(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.state != stateConfig {
 		return m, nil
 	}
@@ -373,7 +373,7 @@ func nextFocus(key string, current, total int) int {
 	return current
 }
 
-func (m model) startConversion() (tea.Model, tea.Cmd) {
+func (m *model) startConversion() (tea.Model, tea.Cmd) {
 	root := strings.TrimSpace(m.inputs[0].Value())
 	out := strings.TrimSpace(m.inputs[1].Value())
 	voice := strings.TrimSpace(m.inputs[2].Value())
@@ -382,7 +382,8 @@ func (m model) startConversion() (tea.Model, tea.Cmd) {
 	}
 
 	cwd, _ := os.Getwd()
-	logPath := filepath.Join(cwd, "markloud_errors.log")
+	logPath := filepath.Join(cwd, "logs", "markloud_errors.log")
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		m.err = fmt.Errorf("failed to open log file: %w", err)
@@ -483,7 +484,7 @@ func (m *model) applyResult(msg fileDoneMsg) {
 	}
 }
 
-func (m model) View() string {
+func (m *model) View() string {
 	switch m.state {
 	case stateConfig:
 		return m.viewConfig()
@@ -513,9 +514,24 @@ var (
 	counterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFE156")).Bold(true)
 )
 
-func (m model) viewConfig() string {
+// Overridden at build time by GoReleaser via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = ""
+)
+
+func versionLabel() string {
+	v := strings.TrimSpace(version)
+	if v == "" {
+		v = "dev"
+	}
+	return fmt.Sprintf("MarkLoud %s", v)
+}
+
+func (m *model) viewConfig() string {
 	rows := []string{
-		titleStyle.Render("MarkLoud ▸ Markdown → AAC (OpenAI)"),
+		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → AAC (OpenAI)", versionLabel())),
 		fmt.Sprintf("%s %s", labelStyle.Render("API key:"), presentMissing(os.Getenv("OPENAI_API_KEY"))),
 		"",
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
@@ -531,7 +547,7 @@ func (m model) viewConfig() string {
 		rows = append(rows, dimStyle.Render(m.message))
 	}
 
-	rows = append(rows, dimStyle.Render("tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
+	rows = append(rows, dimStyle.Render(versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }
@@ -550,7 +566,7 @@ func boolBadge(v bool) string {
 	return dimStyle.Render("off")
 }
 
-func (m model) renderActive() []string {
+func (m *model) renderActive() []string {
 	lines := []string{}
 	names := make([]string, 0, len(m.tasks))
 	for k := range m.tasks {
@@ -613,7 +629,7 @@ func (m *model) logf(format string, args ...any) {
 	fmt.Fprintf(m.logFile, format, args...)
 }
 
-func (m model) viewRunning() string {
+func (m *model) viewRunning() string {
 	total := len(m.jobs)
 	current := m.currentIdx
 	bar := fmt.Sprintf("%s %d/%d files", m.spin.View(), current, total)
@@ -626,7 +642,7 @@ func (m model) viewRunning() string {
 	)
 
 	lines := []string{
-		titleStyle.Render("Synthesizing…"),
+		titleStyle.Render(fmt.Sprintf("%s — Synthesizing…", versionLabel())),
 		bar,
 		summary,
 		"",
@@ -651,9 +667,9 @@ func (m model) viewRunning() string {
 	return boxStyle.Width(76).Render(strings.Join(lines, "\n"))
 }
 
-func (m model) viewDone() string {
+func (m *model) viewDone() string {
 	lines := []string{
-		titleStyle.Render("All done!"),
+		titleStyle.Render(fmt.Sprintf("%s — All done!", versionLabel())),
 		fmt.Sprintf("%s %d · %s %d · %s %d · %s %d",
 			counterStyle.Render("written"), m.summary.Done,
 			labelStyle.Render("skipped"), m.summary.Skipped,
@@ -670,9 +686,9 @@ func (m model) viewDone() string {
 	return boxStyle.Width(76).Render(strings.Join(lines, "\n"))
 }
 
-func (m model) viewError() string {
+func (m *model) viewError() string {
 	lines := []string{
-		errorStyle.Render("Error"),
+		errorStyle.Render(fmt.Sprintf("%s — Error", versionLabel())),
 		m.err.Error(),
 		"",
 		emphStyle.Render("Press enter to go back or q to quit."),
@@ -688,7 +704,13 @@ func main() {
 	outputDir := flag.String("o", "", "Output directory for audio files")
 	voice := flag.String("voice", envOr("OPENAI_TTS_VOICE", "alloy"), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
 	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("markloud %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
 
 	var opts *cliOptions
 	if *inputDir != "" {
