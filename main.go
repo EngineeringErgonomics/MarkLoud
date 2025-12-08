@@ -80,6 +80,8 @@ type model struct {
 	summary      summaryCounts
 	currentChunk string
 	lastError    string
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	workerSem chan struct{}
 	chunkCh   chan chunkMsg
@@ -137,6 +139,7 @@ func initialModel(opts *cliOptions) *model {
 		overwrite:  false,
 		message:    "",
 		err:        nil,
+		ctx:        context.Background(),
 		spin:       spin,
 		tasks:      make(map[string]taskStatus),
 	}
@@ -206,6 +209,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentChunk = "waiting…"
 		m.lastError = ""
 		m.tasks = make(map[string]taskStatus)
+		if m.cancel != nil {
+			m.cancel()
+		}
+		m.ctx, m.cancel = context.WithCancel(context.Background())
 
 		// Set up error log file if not already set
 		if m.logFile == nil {
@@ -228,7 +235,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		cmds := []tea.Cmd{m.spin.Tick, listenChunks(m.chunkCh)}
 		for idx, job := range msg.jobs {
-			cmds = append(cmds, runJobCmd(msg.cfg, job, idx, m.workerSem, m.chunkCh))
+			cmds = append(cmds, runJobCmd(m.ctx, msg.cfg, job, idx, m.workerSem, m.chunkCh))
 		}
 		return m, tea.Batch(cmds...)
 	case prepareFailedMsg:
@@ -250,6 +257,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case allDoneMsg:
 		m.state = stateDone
 		m.message = "Conversion finished."
+		if m.cancel != nil {
+			m.cancel()
+			m.cancel = nil
+		}
 		if m.logFile != nil {
 			fmt.Fprintf(m.logFile, "=== run finished %s ===\n", time.Now().Format(time.RFC3339))
 			m.logFile.Close()
@@ -327,6 +338,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case stateRunning:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
+			if m.cancel != nil {
+				m.cancel()
+				m.cancel = nil
+			}
 			return m, tea.Quit
 		}
 	case stateDone, stateError:
@@ -431,12 +446,11 @@ func prepareConversionCmd(cfg appConfig) tea.Cmd {
 	}
 }
 
-func runJobCmd(cfg appConfig, job fileJob, idx int, sem chan struct{}, chunkCh chan<- chunkMsg) tea.Cmd {
+func runJobCmd(ctx context.Context, cfg appConfig, job fileJob, idx int, sem chan struct{}, chunkCh chan<- chunkMsg) tea.Cmd {
 	return func() tea.Msg {
 		sem <- struct{}{}
 		defer func() { <-sem }()
 
-		ctx := context.Background()
 		res := processFile(ctx, job, cfg, func(cur, total int) {
 			chunkCh <- chunkMsg{job: job, idx: cur, total: total}
 		})
