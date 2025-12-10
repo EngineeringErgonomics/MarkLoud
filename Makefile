@@ -1,6 +1,6 @@
 GOFILES := $(shell find . -name '*.go' -not -path './vendor/*' -not -path './.git/*')
 
-.PHONY: fmt fmtcheck vet lint test test-race tidy coverage ci
+.PHONY: fmt fmtcheck vet lint test test-race tidy coverage ci build
 
 fmt:
 	gofmt -w $(GOFILES)
@@ -30,6 +30,9 @@ tidy:
 	go mod tidy
 
 ci: fmtcheck vet lint test
+
+build:
+	go build -o markloud ./cmd/markloud
 
 goreleaser-check:
 	goreleaser check
