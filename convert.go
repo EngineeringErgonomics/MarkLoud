@@ -201,6 +201,9 @@ func collectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]fileJ
 }
 
 func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(current, total int)) jobResult {
+	if err := ctx.Err(); err != nil {
+		return jobResult{Status: jobFailed, Err: err}
+	}
 	// Idempotent skip
 	if !cfg.Overwrite {
 		if _, err := os.Stat(job.DestPath); err == nil {
@@ -232,6 +235,9 @@ func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(
 	}
 	var buf bytes.Buffer
 	for idx, chunk := range chunks {
+		if err := ctx.Err(); err != nil {
+			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
+		}
 		if progress != nil {
 			progress(idx+1, totalChunks)
 		}
