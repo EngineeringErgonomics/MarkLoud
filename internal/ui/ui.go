@@ -537,7 +537,6 @@ var (
 	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8BA7")).Bold(true)
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
 	emphStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#F6D186")).Bold(true)
-	keyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#A0E7E5"))
 	counterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFE156")).Bold(true)
 )
 

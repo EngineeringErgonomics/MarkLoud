@@ -76,10 +76,10 @@ func SetTTSClient(c TTSClient) {
 var (
 	codeFenceRe    = regexp.MustCompile("(?s)```.*?```")
 	inlineCodeRe   = regexp.MustCompile("`([^`]*)`")
-	headingRe      = regexp.MustCompile("(?m)^#+\\s*")
-	bulletRe       = regexp.MustCompile("(?m)^[>-]\\s*")
+	headingRe      = regexp.MustCompile(`(?m)^#+\s*`)
+	bulletRe       = regexp.MustCompile(`(?m)^[>-]\s*`)
 	linkRe         = regexp.MustCompile(`\[((?:[^\]]|\\])+)]\([^)]+\)`)
-	multiNewlineRe = regexp.MustCompile("\n{3,}")
+	multiNewlineRe = regexp.MustCompile(`\n{3,}`)
 )
 
 // StripMarkdown removes light Markdown syntax for cleaner TTS output.
