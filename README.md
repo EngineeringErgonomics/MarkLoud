@@ -48,6 +48,7 @@ Markdown → AAC in a Bubble Tea TUI powered by OpenAI’s tts-1-hd-1106 model. 
 - The app uses `OPENAI_API_KEY` from your environment (or `.env` if present).
 - Voice defaults to `alloy`, but you can type any supported voice name.
 - Output uses AAC (user request said “ACC” — AAC is the correct response format for the OpenAI endpoint).
+- See `.env.example` for environment variable scaffolding; do **not** commit your real key.
 
 ## Development
 
