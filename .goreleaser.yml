@@ -6,7 +6,7 @@ before:
 
 builds:
   - id: markloud
-    main: ./main.go
+    main: ./cmd/markloud/main.go
     binary: markloud
     env:
       - CGO_ENABLED=0

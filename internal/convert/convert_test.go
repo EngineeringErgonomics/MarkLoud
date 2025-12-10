@@ -1,4 +1,4 @@
-package main
+package convert
 
 import (
 	"context"
@@ -15,7 +15,7 @@ type mockTTSClient struct {
 	err    error
 }
 
-func (m *mockTTSClient) Synthesize(_ context.Context, _ appConfig, chunk string) ([]byte, error) {
+func (m *mockTTSClient) Synthesize(_ context.Context, _ Config, chunk string) ([]byte, error) {
 	m.calls++
 	m.chunks = append(m.chunks, chunk)
 	if m.err != nil {
@@ -33,15 +33,15 @@ func TestStripMarkdown(t *testing.T) {
 
 	expected := "Title\n\nSome inline code and a link.\n\nbullet one\nbullet two"
 
-	got := stripMarkdown(md)
+	got := StripMarkdown(md)
 	if got != expected {
-		t.Fatalf("stripMarkdown() = %q, want %q", got, expected)
+		t.Fatalf("StripMarkdown() = %q, want %q", got, expected)
 	}
 }
 
 func TestChunkTextRespectsLimit(t *testing.T) {
 	text := strings.Repeat("Lorem ipsum dolor sit amet. ", 200)
-	chunks := chunkText(text, 200)
+	chunks := ChunkText(text, 200)
 	if len(chunks) == 0 {
 		t.Fatalf("expected chunks, got none")
 	}
@@ -67,9 +67,9 @@ func TestCollectMarkdownFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	jobs, err := collectMarkdownFiles(root, filepath.Join(root, "out"), "*.md", "aac")
+	jobs, err := CollectMarkdownFiles(root, filepath.Join(root, "out"), "*.md", "aac")
 	if err != nil {
-		t.Fatalf("collectMarkdownFiles error: %v", err)
+		t.Fatalf("CollectMarkdownFiles error: %v", err)
 	}
 	if len(jobs) != 1 {
 		t.Fatalf("expected 1 job, got %d", len(jobs))
@@ -96,12 +96,12 @@ func TestProcessFileSkipsExisting(t *testing.T) {
 
 	mock := &mockTTSClient{}
 	old := ttsClient
-	setTTSClient(mock)
-	t.Cleanup(func() { setTTSClient(old) })
+	SetTTSClient(mock)
+	t.Cleanup(func() { SetTTSClient(old) })
 
-	res := processFile(context.Background(), fileJob{AbsPath: src, RelPath: "file.md", DestPath: dest}, appConfig{Overwrite: false}, nil)
-	if res.Status != jobSkipped {
-		t.Fatalf("expected jobSkipped, got %s", res.Status)
+	res := ProcessFile(context.Background(), FileJob{AbsPath: src, RelPath: "file.md", DestPath: dest}, Config{Overwrite: false}, nil)
+	if res.Status != JobSkipped {
+		t.Fatalf("expected JobSkipped, got %s", res.Status)
 	}
 	if mock.calls != 0 {
 		t.Fatalf("expected TTS not to be called, got %d", mock.calls)
@@ -119,13 +119,13 @@ func TestProcessFileUsesTTSClient(t *testing.T) {
 
 	mock := &mockTTSClient{resp: []byte("AUDIO")}
 	old := ttsClient
-	setTTSClient(mock)
-	t.Cleanup(func() { setTTSClient(old) })
+	SetTTSClient(mock)
+	t.Cleanup(func() { SetTTSClient(old) })
 
-	cfg := appConfig{Overwrite: true, ResponseFormat: "aac"}
-	res := processFile(context.Background(), fileJob{AbsPath: src, RelPath: "file.md", DestPath: dest}, cfg, nil)
-	if res.Status != jobDone {
-		t.Fatalf("expected jobDone, got %s", res.Status)
+	cfg := Config{Overwrite: true, ResponseFormat: "aac"}
+	res := ProcessFile(context.Background(), FileJob{AbsPath: src, RelPath: "file.md", DestPath: dest}, cfg, nil)
+	if res.Status != JobDone {
+		t.Fatalf("expected JobDone, got %s", res.Status)
 	}
 	if mock.calls == 0 {
 		t.Fatalf("expected TTS client to be called")

@@ -1,9 +1,8 @@
-package main
+package ui
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,7 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/joho/godotenv"
+	"github.com/markloud/markloud/internal/convert"
 )
 
 type appState int
@@ -37,20 +36,20 @@ type summaryCounts struct {
 }
 
 type preparedMsg struct {
-	cfg  appConfig
-	jobs []fileJob
+	cfg  convert.Config
+	jobs []convert.FileJob
 }
 
 type prepareFailedMsg struct{ err error }
 
 type fileDoneMsg struct {
 	idx int
-	res jobResult
-	job fileJob
+	res convert.JobResult
+	job convert.FileJob
 }
 
 type chunkMsg struct {
-	job   fileJob
+	job   convert.FileJob
 	idx   int
 	total int
 	done  bool
@@ -59,11 +58,17 @@ type chunkMsg struct {
 
 type allDoneMsg struct{}
 
-type cliOptions struct {
-	inputDir  string
-	outputDir string
-	voice     string
-	overwrite bool
+type CLIOptions struct {
+	InputDir  string
+	OutputDir string
+	Voice     string
+	Overwrite bool
+}
+
+type VersionInfo struct {
+	Version string
+	Commit  string
+	Date    string
 }
 
 type model struct {
@@ -74,14 +79,15 @@ type model struct {
 	message    string
 	err        error
 
-	cfg          appConfig
-	jobs         []fileJob
+	cfg          convert.Config
+	jobs         []convert.FileJob
 	currentIdx   int
 	summary      summaryCounts
 	currentChunk string
 	lastError    string
 	ctx          context.Context
 	cancel       context.CancelFunc
+	version      VersionInfo
 
 	workerSem chan struct{}
 	chunkCh   chan chunkMsg
@@ -95,7 +101,7 @@ type model struct {
 
 	// CLI mode - skip config screen and auto-quit on completion
 	cliMode bool
-	cliOpts *cliOptions
+	cliOpts *CLIOptions
 }
 
 type taskStatus struct {
@@ -106,7 +112,15 @@ type taskStatus struct {
 	err    error
 }
 
-func initialModel(opts *cliOptions) *model {
+// Run launches the Bubble Tea UI with optional CLI defaults and version info.
+func Run(opts *CLIOptions, v VersionInfo) error {
+	m := initialModel(opts, v)
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
+
+func initialModel(opts *CLIOptions, v VersionInfo) *model {
 	tiRoot := textinput.New()
 	tiRoot.Placeholder = "./notes"
 	tiRoot.SetValue(".")
@@ -142,16 +156,17 @@ func initialModel(opts *cliOptions) *model {
 		ctx:        context.Background(),
 		spin:       spin,
 		tasks:      make(map[string]taskStatus),
+		version:    v,
 	}
 
 	// CLI mode: pre-fill inputs and mark for auto-start
 	if opts != nil {
 		m.cliMode = true
 		m.cliOpts = opts
-		m.inputs[0].SetValue(opts.inputDir)
-		m.inputs[1].SetValue(opts.outputDir)
-		m.inputs[2].SetValue(opts.voice)
-		m.overwrite = opts.overwrite
+		m.inputs[0].SetValue(opts.InputDir)
+		m.inputs[1].SetValue(opts.OutputDir)
+		m.inputs[2].SetValue(opts.Voice)
+		m.overwrite = opts.Overwrite
 	}
 
 	return m
@@ -166,7 +181,6 @@ func envOr(key, fallback string) string {
 
 func (m *model) Init() tea.Cmd {
 	if m.cliMode {
-		// Auto-start conversion in CLI mode
 		return m.startConversionCmd()
 	}
 	return textinput.Blink
@@ -180,7 +194,7 @@ func (m *model) startConversionCmd() tea.Cmd {
 		voice = "alloy"
 	}
 
-	cfg := appConfig{
+	cfg := convert.Config{
 		Root:           root,
 		Out:            out,
 		Voice:          voice,
@@ -241,7 +255,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case prepareFailedMsg:
 		m.err = msg.err
 		m.message = ""
-		// In CLI mode, show error and quit
 		if m.cliMode {
 			m.state = stateError
 			return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return tea.Quit() })
@@ -257,16 +270,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case allDoneMsg:
 		m.state = stateDone
 		m.message = "Conversion finished."
-		if m.cancel != nil {
-			m.cancel()
-			m.cancel = nil
-		}
 		if m.logFile != nil {
 			fmt.Fprintf(m.logFile, "=== run finished %s ===\n", time.Now().Format(time.RFC3339))
 			m.logFile.Close()
 			m.logFile = nil
 		}
-		// Auto-quit in CLI mode after brief display
+		if m.cancel != nil {
+			m.cancel()
+			m.cancel = nil
+		}
 		if m.cliMode {
 			return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return tea.Quit() })
 		}
@@ -291,7 +303,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tasks[key] = ts
 
 		m.currentChunk = fmt.Sprintf("%s (%d/%d)", msg.job.RelPath, msg.idx, msg.total)
-		// Only re-listen if still running (prevents goroutine leak after completion)
 		if m.state == stateRunning {
 			return m, listenChunks(m.chunkCh)
 		}
@@ -327,13 +338,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "o":
-			// 'o' toggles overwrite
 			m.overwrite = !m.overwrite
 			return m, nil
 		case "enter":
 			return m.startConversion()
 		default:
-			// let text inputs handle normal typing/paste
 			return m.updateInputs(msg)
 		}
 	case stateRunning:
@@ -346,6 +355,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case stateDone, stateError:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
+			if m.cancel != nil {
+				m.cancel()
+				m.cancel = nil
+			}
 			return m, tea.Quit
 		}
 		if msg.String() == "enter" {
@@ -406,7 +419,7 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 	}
 	fmt.Fprintf(logFile, "\n=== MarkLoud run %s ===\n", time.Now().Format(time.RFC3339))
 
-	cfg := appConfig{
+	cfg := convert.Config{
 		Root:           root,
 		Out:            out,
 		Voice:          voice,
@@ -426,7 +439,7 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 	return m, prepareConversionCmd(cfg)
 }
 
-func prepareConversionCmd(cfg appConfig) tea.Cmd {
+func prepareConversionCmd(cfg convert.Config) tea.Cmd {
 	return func() tea.Msg {
 		if cfg.APIKey == "" {
 			return prepareFailedMsg{errors.New("OPENAI_API_KEY is not set")}
@@ -435,7 +448,7 @@ func prepareConversionCmd(cfg appConfig) tea.Cmd {
 		if err != nil || !info.IsDir() {
 			return prepareFailedMsg{fmt.Errorf("input directory not found: %s", cfg.Root)}
 		}
-		jobs, err := collectMarkdownFiles(cfg.Root, cfg.Out, cfg.Pattern, cfg.ResponseFormat)
+		jobs, err := convert.CollectMarkdownFiles(cfg.Root, cfg.Out, cfg.Pattern, cfg.ResponseFormat)
 		if err != nil {
 			return prepareFailedMsg{err}
 		}
@@ -446,12 +459,12 @@ func prepareConversionCmd(cfg appConfig) tea.Cmd {
 	}
 }
 
-func runJobCmd(ctx context.Context, cfg appConfig, job fileJob, idx int, sem chan struct{}, chunkCh chan<- chunkMsg) tea.Cmd {
+func runJobCmd(ctx context.Context, cfg convert.Config, job convert.FileJob, idx int, sem chan struct{}, chunkCh chan<- chunkMsg) tea.Cmd {
 	return func() tea.Msg {
 		sem <- struct{}{}
 		defer func() { <-sem }()
 
-		res := processFile(ctx, job, cfg, func(cur, total int) {
+		res := convert.ProcessFile(ctx, job, cfg, func(cur, total int) {
 			chunkCh <- chunkMsg{job: job, idx: cur, total: total}
 		})
 		chunkCh <- chunkMsg{job: job, idx: res.Chunks, total: res.Chunks, done: true, err: res.Err}
@@ -473,18 +486,18 @@ func (m *model) applyResult(msg fileDoneMsg) {
 	ts := m.tasks[msg.job.RelPath]
 	ts.name = msg.job.RelPath
 	switch msg.res.Status {
-	case jobDone:
+	case convert.JobDone:
 		m.summary.Done++
 		ts.status = "done"
-	case jobSkipped:
+	case convert.JobSkipped:
 		m.summary.Skipped++
 		m.currentChunk = fmt.Sprintf("%s (skipped)", msg.job.RelPath)
 		ts.status = "skipped"
-	case jobEmpty:
+	case convert.JobEmpty:
 		m.summary.Empty++
 		m.currentChunk = fmt.Sprintf("%s (empty)", msg.job.RelPath)
 		ts.status = "empty"
-	case jobFailed:
+	case convert.JobFailed:
 		m.summary.Failed++
 		ts.status = "error"
 		ts.err = msg.res.Err
@@ -528,15 +541,8 @@ var (
 	counterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFE156")).Bold(true)
 )
 
-// Overridden at build time by GoReleaser via -ldflags.
-var (
-	version = "dev"
-	commit  = "none"
-	date    = ""
-)
-
-func versionLabel() string {
-	v := strings.TrimSpace(version)
+func (m *model) versionLabel() string {
+	v := strings.TrimSpace(m.version.Version)
 	if v == "" {
 		v = "dev"
 	}
@@ -545,7 +551,7 @@ func versionLabel() string {
 
 func (m *model) viewConfig() string {
 	rows := []string{
-		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → AAC (OpenAI)", versionLabel())),
+		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → AAC (OpenAI)", m.versionLabel())),
 		fmt.Sprintf("%s %s", labelStyle.Render("API key:"), presentMissing(os.Getenv("OPENAI_API_KEY"))),
 		"",
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
@@ -561,7 +567,7 @@ func (m *model) viewConfig() string {
 		rows = append(rows, dimStyle.Render(m.message))
 	}
 
-	rows = append(rows, dimStyle.Render(versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
+	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }
@@ -656,7 +662,7 @@ func (m *model) viewRunning() string {
 	)
 
 	lines := []string{
-		titleStyle.Render(fmt.Sprintf("%s — Synthesizing…", versionLabel())),
+		titleStyle.Render(fmt.Sprintf("%s — Synthesizing…", m.versionLabel())),
 		bar,
 		summary,
 		"",
@@ -683,7 +689,7 @@ func (m *model) viewRunning() string {
 
 func (m *model) viewDone() string {
 	lines := []string{
-		titleStyle.Render(fmt.Sprintf("%s — All done!", versionLabel())),
+		titleStyle.Render(fmt.Sprintf("%s — All done!", m.versionLabel())),
 		fmt.Sprintf("%s %d · %s %d · %s %d · %s %d",
 			counterStyle.Render("written"), m.summary.Done,
 			labelStyle.Render("skipped"), m.summary.Skipped,
@@ -702,46 +708,10 @@ func (m *model) viewDone() string {
 
 func (m *model) viewError() string {
 	lines := []string{
-		errorStyle.Render(fmt.Sprintf("%s — Error", versionLabel())),
+		errorStyle.Render(fmt.Sprintf("%s — Error", m.versionLabel())),
 		m.err.Error(),
 		"",
 		emphStyle.Render("Press enter to go back or q to quit."),
 	}
 	return boxStyle.Width(76).Render(strings.Join(lines, "\n"))
-}
-
-func main() {
-	_ = godotenv.Load()
-
-	// CLI flags
-	inputDir := flag.String("i", "", "Input directory containing markdown files")
-	outputDir := flag.String("o", "", "Output directory for audio files")
-	voice := flag.String("voice", envOr("OPENAI_TTS_VOICE", "alloy"), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
-	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
-	showVersion := flag.Bool("version", false, "Print version and exit")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Printf("markloud %s (commit %s, built %s)\n", version, commit, date)
-		return
-	}
-
-	var opts *cliOptions
-	if *inputDir != "" {
-		if *outputDir == "" {
-			*outputDir = "./audio_out"
-		}
-		opts = &cliOptions{
-			inputDir:  *inputDir,
-			outputDir: *outputDir,
-			voice:     *voice,
-			overwrite: *overwrite,
-		}
-	}
-
-	p := tea.NewProgram(initialModel(opts), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Println("error:", err)
-		os.Exit(1)
-	}
 }

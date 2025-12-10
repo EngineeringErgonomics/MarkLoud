@@ -12,9 +12,9 @@ Markdown → AAC in a Bubble Tea TUI powered by OpenAI’s tts-1-hd-1106 model. 
    ```
 2. Run the TUI:
    ```bash
-   go run .
+   go run ./cmd/markloud
    # or
-   go build -o markloud && ./markloud
+   go build -o markloud ./cmd/markloud && ./markloud
    ```
 
 3. Check version metadata (set by GoReleaser builds):

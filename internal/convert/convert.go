@@ -1,4 +1,4 @@
-package main
+package convert
 
 import (
 	"bytes"
@@ -15,7 +15,8 @@ import (
 	"time"
 )
 
-type appConfig struct {
+// Config holds inputs for a conversion run.
+type Config struct {
 	Root           string
 	Out            string
 	Voice          string
@@ -28,30 +29,32 @@ type appConfig struct {
 	Pattern        string
 }
 
-type fileJob struct {
+// FileJob describes one markdown file to convert.
+type FileJob struct {
 	AbsPath  string
 	RelPath  string
 	DestPath string
 }
 
-type jobOutcome string
+type JobOutcome string
 
 const (
-	jobDone    jobOutcome = "done"
-	jobSkipped jobOutcome = "skipped"
-	jobEmpty   jobOutcome = "empty"
-	jobFailed  jobOutcome = "failed"
+	JobDone    JobOutcome = "done"
+	JobSkipped JobOutcome = "skipped"
+	JobEmpty   JobOutcome = "empty"
+	JobFailed  JobOutcome = "failed"
 )
 
-type jobResult struct {
-	Status jobOutcome
+// JobResult represents the result of processing one file.
+type JobResult struct {
+	Status JobOutcome
 	Chunks int
 	Err    error
 }
 
-// TTSClient abstracts the text-to-speech provider so we can swap in a mock during tests.
+// TTSClient abstracts the text-to-speech provider so tests can swap in a mock.
 type TTSClient interface {
-	Synthesize(ctx context.Context, cfg appConfig, chunk string) ([]byte, error)
+	Synthesize(ctx context.Context, cfg Config, chunk string) ([]byte, error)
 }
 
 type openAIClient struct {
@@ -63,7 +66,8 @@ var (
 	ttsClient         TTSClient = &openAIClient{httpClient: defaultHTTPClient}
 )
 
-func setTTSClient(c TTSClient) {
+// SetTTSClient overrides the global TTS client (used in tests).
+func SetTTSClient(c TTSClient) {
 	if c != nil {
 		ttsClient = c
 	}
@@ -74,11 +78,12 @@ var (
 	inlineCodeRe   = regexp.MustCompile("`([^`]*)`")
 	headingRe      = regexp.MustCompile("(?m)^#+\\s*")
 	bulletRe       = regexp.MustCompile("(?m)^[>-]\\s*")
-	linkRe         = regexp.MustCompile(`\[((?:[^\]]|\\])+)\]\([^)]+\)`)
+	linkRe         = regexp.MustCompile(`\[((?:[^\]]|\\])+)]\([^)]+\)`)
 	multiNewlineRe = regexp.MustCompile("\n{3,}")
 )
 
-func stripMarkdown(md string) string {
+// StripMarkdown removes light Markdown syntax for cleaner TTS output.
+func StripMarkdown(md string) string {
 	md = codeFenceRe.ReplaceAllString(md, "")
 	md = inlineCodeRe.ReplaceAllString(md, "$1")
 	md = headingRe.ReplaceAllString(md, "")
@@ -88,7 +93,8 @@ func stripMarkdown(md string) string {
 	return strings.TrimSpace(md)
 }
 
-func chunkText(text string, maxChars int) []string {
+// ChunkText splits text into roughly maxChars-sized chunks at paragraph/sentence boundaries.
+func ChunkText(text string, maxChars int) []string {
 	if maxChars <= 0 {
 		maxChars = 4000
 	}
@@ -161,14 +167,15 @@ func chunkText(text string, maxChars int) []string {
 	return out
 }
 
-func collectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]fileJob, error) {
+// CollectMarkdownFiles returns a list of jobs for matching markdown files.
+func CollectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]FileJob, error) {
 	if pattern == "" {
 		pattern = "*.md"
 	}
 	root = filepath.Clean(root)
 	outDir = filepath.Clean(outDir)
 
-	var jobs []fileJob
+	var jobs []FileJob
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -190,7 +197,7 @@ func collectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]fileJ
 		ext := filepath.Ext(rel)
 		destRel := strings.TrimSuffix(rel, ext) + "." + responseFormat
 		destPath := filepath.Join(outDir, destRel)
-		jobs = append(jobs, fileJob{
+		jobs = append(jobs, FileJob{
 			AbsPath:  path,
 			RelPath:  rel,
 			DestPath: destPath,
@@ -200,33 +207,34 @@ func collectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]fileJ
 	return jobs, err
 }
 
-func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(current, total int)) jobResult {
+// ProcessFile converts a single file using the configured TTS client.
+func ProcessFile(ctx context.Context, job FileJob, cfg Config, progress func(current, total int)) JobResult {
 	if err := ctx.Err(); err != nil {
-		return jobResult{Status: jobFailed, Err: err}
+		return JobResult{Status: JobFailed, Err: err}
 	}
-	// Idempotent skip
+
 	if !cfg.Overwrite {
 		if _, err := os.Stat(job.DestPath); err == nil {
-			return jobResult{Status: jobSkipped, Chunks: 0, Err: nil}
+			return JobResult{Status: JobSkipped, Chunks: 0, Err: nil}
 		}
 	}
 
 	data, err := os.ReadFile(job.AbsPath)
 	if err != nil {
-		return jobResult{Status: jobFailed, Err: err}
+		return JobResult{Status: JobFailed, Err: err}
 	}
-	plain := stripMarkdown(string(data))
+	plain := StripMarkdown(string(data))
 	if strings.TrimSpace(plain) == "" {
-		return jobResult{Status: jobEmpty}
+		return JobResult{Status: JobEmpty}
 	}
 
-	chunks := chunkText(plain, 4000)
+	chunks := ChunkText(plain, 4000)
 	if len(chunks) == 0 {
-		return jobResult{Status: jobEmpty}
+		return JobResult{Status: JobEmpty}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(job.DestPath), 0o755); err != nil {
-		return jobResult{Status: jobFailed, Err: err}
+		return JobResult{Status: JobFailed, Err: err}
 	}
 
 	totalChunks := len(chunks)
@@ -236,31 +244,31 @@ func processFile(ctx context.Context, job fileJob, cfg appConfig, progress func(
 	var buf bytes.Buffer
 	for idx, chunk := range chunks {
 		if err := ctx.Err(); err != nil {
-			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
+			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: err}
 		}
 		if progress != nil {
 			progress(idx+1, totalChunks)
 		}
 		if ttsClient == nil {
-			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: errors.New("tts client not configured")}
+			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: errors.New("tts client not configured")}
 		}
 		chunkAudio, err := ttsClient.Synthesize(ctx, cfg, chunk)
 		if err != nil {
-			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
+			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: err}
 		}
 		if _, err := buf.Write(chunkAudio); err != nil {
-			return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
+			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: err}
 		}
 	}
 
 	if err := os.WriteFile(job.DestPath, buf.Bytes(), 0o644); err != nil {
-		return jobResult{Status: jobFailed, Chunks: totalChunks, Err: err}
+		return JobResult{Status: JobFailed, Chunks: totalChunks, Err: err}
 	}
 
-	return jobResult{Status: jobDone, Chunks: len(chunks)}
+	return JobResult{Status: JobDone, Chunks: len(chunks)}
 }
 
-func (c *openAIClient) Synthesize(ctx context.Context, cfg appConfig, chunk string) ([]byte, error) {
+func (c *openAIClient) Synthesize(ctx context.Context, cfg Config, chunk string) ([]byte, error) {
 	if cfg.APIKey == "" {
 		return nil, errors.New("OPENAI_API_KEY is missing")
 	}
