@@ -22,6 +22,7 @@ func main() {
 	inputDir := flag.String("i", "", "Input directory containing markdown files")
 	outputDir := flag.String("o", "", "Output directory for audio files")
 	voice := flag.String("voice", getenv("OPENAI_TTS_VOICE", "alloy"), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
+	format := flag.String("format", getenv("OPENAI_TTS_FORMAT", "aac"), "Audio format (mp3, opus, flac, aac)")
 	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
@@ -40,6 +41,7 @@ func main() {
 			InputDir:  *inputDir,
 			OutputDir: *outputDir,
 			Voice:     *voice,
+			Format:    *format,
 			Overwrite: *overwrite,
 		}
 	}
