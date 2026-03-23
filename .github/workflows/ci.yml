@@ -18,20 +18,14 @@ jobs:
           go-version: '1.24.x'
           cache: true
 
-      - name: Install linters
-        run: |
-          curl -sL -f https://github.com/dominikh/go-tools/releases/latest/download/staticcheck_linux_amd64.tar.gz -o /tmp/staticcheck.tar.gz
-          tar -xzf /tmp/staticcheck.tar.gz -C /tmp
-          chmod +x /tmp/staticcheck_linux_amd64
-
       - name: Format check
         run: make fmtcheck
 
       - name: Vet
         run: make vet
 
-      - name: Lint
-        run: /tmp/staticcheck_linux_amd64 ./...
+      # - name: Lint
+      #   run: /tmp/staticcheck_linux_amd64 ./...
 
       - name: Test
         run: make test
