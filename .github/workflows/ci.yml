@@ -20,8 +20,8 @@ jobs:
 
       - name: Install staticcheck
         run: |
+          export GOTOOLCHAIN=auto
           go install honnef.co/go/tools/cmd/staticcheck@latest
-          mv ~/go/bin/staticcheck /tmp/staticcheck
 
       - name: Format check
         run: make fmtcheck
@@ -30,7 +30,7 @@ jobs:
         run: make vet
 
       - name: Lint
-        run: /tmp/staticcheck ./...
+        run: staticcheck ./...
 
       - name: Test
         run: make test
