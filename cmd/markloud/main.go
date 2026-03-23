@@ -24,6 +24,7 @@ func main() {
 	voice := flag.String("voice", getenv("OPENAI_TTS_VOICE", "alloy"), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
 	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	resume := flag.Bool("resume", false, "Resume from previous run if state exists")
 	flag.Parse()
 
 	if *showVersion {
@@ -41,6 +42,7 @@ func main() {
 			OutputDir: *outputDir,
 			Voice:     *voice,
 			Overwrite: *overwrite,
+			Resume:    *resume,
 		}
 	}
 

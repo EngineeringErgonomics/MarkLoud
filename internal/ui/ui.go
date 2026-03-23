@@ -23,6 +23,7 @@ type appState int
 
 const (
 	stateConfig appState = iota
+	stateResume
 	stateRunning
 	stateDone
 	stateError
@@ -63,6 +64,7 @@ type CLIOptions struct {
 	OutputDir string
 	Voice     string
 	Overwrite bool
+	Resume    bool
 }
 
 type VersionInfo struct {
@@ -102,6 +104,10 @@ type model struct {
 	// CLI mode - skip config screen and auto-quit on completion
 	cliMode bool
 	cliOpts *CLIOptions
+
+	// Resume support
+	resumeState  *convert.RunState
+	stateManager *convert.StateManager
 }
 
 type taskStatus struct {
@@ -183,7 +189,29 @@ func (m *model) Init() tea.Cmd {
 	if m.cliMode {
 		return m.startConversionCmd()
 	}
-	return textinput.Blink
+	// TUI mode: check for existing state to offer resume
+	return m.checkExistingStateCmd()
+}
+
+func (m *model) checkExistingStateCmd() tea.Cmd {
+	return func() tea.Msg {
+		sm, state, err := convert.LoadOrCreateState(
+			strings.TrimSpace(m.inputs[0].Value()),
+			strings.TrimSpace(m.inputs[1].Value()),
+			strings.TrimSpace(m.inputs[2].Value()),
+			"*.md",
+			"aac",
+		)
+		if err != nil {
+			return nil // Silently ignore state loading errors
+		}
+		if state != nil && len(state.Files) > 0 {
+			m.stateManager = sm
+			m.resumeState = state
+			m.state = stateResume
+		}
+		return nil
+	}
 }
 
 func (m *model) startConversionCmd() tea.Cmd {
@@ -207,6 +235,16 @@ func (m *model) startConversionCmd() tea.Cmd {
 		Pattern:        "*.md",
 	}
 
+	// Check if we should resume from previous state
+	if m.cliOpts != nil && m.cliOpts.Resume {
+		sm, state, err := convert.LoadOrCreateState(root, out, voice, "*.md", "aac")
+		if err == nil && state != nil && len(state.Files) > 0 {
+			m.stateManager = sm
+			m.resumeState = state
+			return prepareResumeConversionCmd(cfg, state, sm)
+		}
+	}
+
 	return prepareConversionCmd(cfg)
 }
 
@@ -227,6 +265,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancel()
 		}
 		m.ctx, m.cancel = context.WithCancel(context.Background())
+
+		// Initialize state for fresh runs if not already set (resume case)
+		if m.stateManager == nil {
+			sm, state, err := convert.LoadOrCreateState(
+				msg.cfg.Root,
+				msg.cfg.Out,
+				msg.cfg.Voice,
+				msg.cfg.Pattern,
+				msg.cfg.ResponseFormat,
+			)
+			if err == nil && state == nil {
+				// No existing state - create a new one
+				state = &convert.RunState{
+					Root:           msg.cfg.Root,
+					Out:            msg.cfg.Out,
+					Voice:          msg.cfg.Voice,
+					Pattern:        msg.cfg.Pattern,
+					ResponseFormat: msg.cfg.ResponseFormat,
+					Files:          make(map[string]convert.FileState),
+				}
+				// Initialize file states for all jobs
+				for _, job := range msg.jobs {
+					// We don't know total chunks yet, will update when processing
+					state.Files[job.AbsPath] = convert.FileState{
+						AbsPath:  job.AbsPath,
+						RelPath:  job.RelPath,
+						DestPath: job.DestPath,
+						Status:   convert.JobFailed, // Will be updated when done
+					}
+				}
+				_ = sm.SaveState(state)
+			}
+			m.stateManager = sm
+			m.resumeState = state
+		}
 
 		// Set up error log file if not already set
 		if m.logFile == nil {
@@ -249,7 +322,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		cmds := []tea.Cmd{m.spin.Tick, listenChunks(m.chunkCh)}
 		for idx, job := range msg.jobs {
-			cmds = append(cmds, runJobCmd(m.ctx, msg.cfg, job, idx, m.workerSem, m.chunkCh))
+			cmds = append(cmds, runJobCmd(m.ctx, msg.cfg, job, idx, m.workerSem, m.chunkCh, m.stateManager, m.resumeState))
 		}
 		return m, tea.Batch(cmds...)
 	case prepareFailedMsg:
@@ -274,6 +347,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fmt.Fprintf(m.logFile, "=== run finished %s ===\n", time.Now().Format(time.RFC3339))
 			m.logFile.Close()
 			m.logFile = nil
+		}
+		// Clean up state file on clean completion
+		if m.stateManager != nil {
+			_ = m.stateManager.CleanupState()
+			m.stateManager = nil
+			m.resumeState = nil
 		}
 		if m.cancel != nil {
 			m.cancel()
@@ -345,15 +424,22 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			return m.updateInputs(msg)
 		}
-	case stateRunning:
-		if msg.String() == "ctrl+c" || msg.String() == "q" {
-			if m.cancel != nil {
-				m.cancel()
-				m.cancel = nil
+	case stateResume:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			// Clear state and go to config
+			if m.stateManager != nil {
+				_ = m.stateManager.CleanupState()
 			}
+			m.resumeState = nil
+			m.stateManager = nil
 			return m, tea.Quit
+		case "enter":
+			return m.startResumeConversion()
+		default:
+			return m, nil
 		}
-	case stateDone, stateError:
+	case stateRunning:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			if m.cancel != nil {
 				m.cancel()
@@ -439,6 +525,81 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 	return m, prepareConversionCmd(cfg)
 }
 
+func (m *model) startResumeConversion() (tea.Model, tea.Cmd) {
+	root := strings.TrimSpace(m.inputs[0].Value())
+	out := strings.TrimSpace(m.inputs[1].Value())
+	voice := strings.TrimSpace(m.inputs[2].Value())
+	if voice == "" {
+		voice = "alloy"
+	}
+
+	cwd, _ := os.Getwd()
+	logPath := filepath.Join(cwd, "logs", "markloud_errors.log")
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		m.err = fmt.Errorf("failed to open log file: %w", err)
+		return m, nil
+	}
+	fmt.Fprintf(logFile, "\n=== MarkLoud run (resume) %s ===\n", time.Now().Format(time.RFC3339))
+
+	cfg := convert.Config{
+		Root:           root,
+		Out:            out,
+		Voice:          voice,
+		Model:          "tts-1-hd-1106",
+		ResponseFormat: "aac",
+		Speed:          1.0,
+		Overwrite:      m.overwrite,
+		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
+		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		Pattern:        "*.md",
+	}
+
+	m.err = nil
+	m.message = "Preparing files…"
+	m.logFile = logFile
+	m.logPath = logPath
+	m.cfg = cfg
+	return m, prepareResumeConversionCmd(cfg, m.resumeState, m.stateManager)
+}
+
+func prepareResumeConversionCmd(cfg convert.Config, state *convert.RunState, sm *convert.StateManager) tea.Cmd {
+	return func() tea.Msg {
+		if cfg.APIKey == "" {
+			return prepareFailedMsg{errors.New("OPENAI_API_KEY is not set")}
+		}
+		info, err := os.Stat(cfg.Root)
+		if err != nil || !info.IsDir() {
+			return prepareFailedMsg{fmt.Errorf("input directory not found: %s", cfg.Root)}
+		}
+		jobs, err := convert.CollectMarkdownFiles(cfg.Root, cfg.Out, cfg.Pattern, cfg.ResponseFormat)
+		if err != nil {
+			return prepareFailedMsg{err}
+		}
+		if len(jobs) == 0 {
+			return prepareFailedMsg{fmt.Errorf("no markdown files matching %s", cfg.Pattern)}
+		}
+
+		// Filter out already completed files
+		var pendingJobs []convert.FileJob
+		for _, job := range jobs {
+			if fileState, ok := state.Files[job.AbsPath]; ok {
+				if fileState.Status == convert.JobDone || fileState.Status == convert.JobSkipped || fileState.Status == convert.JobEmpty {
+					continue // Skip already completed
+				}
+			}
+			pendingJobs = append(pendingJobs, job)
+		}
+
+		if len(pendingJobs) == 0 {
+			return prepareFailedMsg{fmt.Errorf("all files have already been converted")}
+		}
+
+		return preparedMsg{cfg: cfg, jobs: pendingJobs}
+	}
+}
+
 func prepareConversionCmd(cfg convert.Config) tea.Cmd {
 	return func() tea.Msg {
 		if cfg.APIKey == "" {
@@ -459,14 +620,28 @@ func prepareConversionCmd(cfg convert.Config) tea.Cmd {
 	}
 }
 
-func runJobCmd(ctx context.Context, cfg convert.Config, job convert.FileJob, idx int, sem chan struct{}, chunkCh chan<- chunkMsg) tea.Cmd {
+func runJobCmd(ctx context.Context, cfg convert.Config, job convert.FileJob, idx int, sem chan struct{}, chunkCh chan<- chunkMsg, sm *convert.StateManager, runState *convert.RunState) tea.Cmd {
 	return func() tea.Msg {
 		sem <- struct{}{}
 		defer func() { <-sem }()
 
-		res := convert.ProcessFile(ctx, job, cfg, func(cur, total int) {
+		// Create checkpoint callback that persists state after each chunk
+		checkpoint := func(chunkIdx int) {
+			if sm == nil || runState == nil {
+				return
+			}
+			// Update the run state with completed chunk
+			if fileState, ok := runState.Files[job.AbsPath]; ok {
+				fileState.MarkChunkDone(chunkIdx)
+				runState.Files[job.AbsPath] = fileState
+			}
+			// Persist to disk
+			_ = sm.SaveState(runState)
+		}
+
+		res := convert.ProcessFileWithCheckpoint(ctx, job, cfg, func(cur, total int) {
 			chunkCh <- chunkMsg{job: job, idx: cur, total: total}
-		})
+		}, checkpoint)
 		chunkCh <- chunkMsg{job: job, idx: res.Chunks, total: res.Chunks, done: true, err: res.Err}
 		return fileDoneMsg{idx: idx, res: res, job: job}
 	}
@@ -509,12 +684,28 @@ func (m *model) applyResult(msg fileDoneMsg) {
 		m.lastError = msg.res.Err.Error()
 		m.logf("ERROR %s: %v\n", msg.job.RelPath, msg.res.Err)
 	}
+
+	// Update persisted state with file completion
+	if m.stateManager != nil && m.resumeState != nil {
+		if fileState, ok := m.resumeState.Files[msg.job.AbsPath]; ok {
+			fileState.Status = msg.res.Status
+			fileState.TotalChunks = msg.res.Chunks
+			// Mark all chunks as done since the file is complete
+			for i := 0; i < msg.res.Chunks; i++ {
+				fileState.MarkChunkDone(i)
+			}
+			m.resumeState.Files[msg.job.AbsPath] = fileState
+		}
+		_ = m.stateManager.SaveState(m.resumeState)
+	}
 }
 
 func (m *model) View() string {
 	switch m.state {
 	case stateConfig:
 		return m.viewConfig()
+	case stateResume:
+		return m.viewResume()
 	case stateRunning:
 		return m.viewRunning()
 	case stateDone:
@@ -567,6 +758,40 @@ func (m *model) viewConfig() string {
 	}
 
 	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
+
+	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
+}
+
+func (m *model) viewResume() string {
+	// Count completed and total files
+	var totalFiles, completedFiles, totalChunks, completedChunks int
+	for _, fs := range m.resumeState.Files {
+		totalFiles++
+		totalChunks += fs.TotalChunks
+		completedChunks += len(fs.CompletedChunks)
+		if fs.Status == convert.JobDone || fs.Status == convert.JobSkipped || fs.Status == convert.JobEmpty {
+			completedFiles++
+		}
+	}
+
+	rows := []string{
+		titleStyle.Render(fmt.Sprintf("%s ▸ Resume Previous Run?", m.versionLabel())),
+		"",
+		labelStyle.Render("Found a previous run that didn't complete:"),
+		fmt.Sprintf("  Input:    %s", valueStyle.Render(m.resumeState.Root)),
+		fmt.Sprintf("  Output:   %s", valueStyle.Render(m.resumeState.Out)),
+		fmt.Sprintf("  Voice:    %s", valueStyle.Render(m.resumeState.Voice)),
+		"",
+		counterStyle.Render("Resume"),
+		labelStyle.Render(fmt.Sprintf("  %d/%d files complete", completedFiles, totalFiles)),
+		labelStyle.Render(fmt.Sprintf("  %d/%d chunks complete", completedChunks, totalChunks)),
+		"",
+		dimStyle.Render("Press " + emphStyle.Render("enter") + " to resume, or " + emphStyle.Render("q") + " to start fresh."),
+	}
+
+	if m.err != nil {
+		rows = append(rows, errorStyle.Render(m.err.Error()))
+	}
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }

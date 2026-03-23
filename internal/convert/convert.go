@@ -209,6 +209,13 @@ func CollectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]FileJ
 
 // ProcessFile converts a single file using the configured TTS client.
 func ProcessFile(ctx context.Context, job FileJob, cfg Config, progress func(current, total int)) JobResult {
+	return ProcessFileWithCheckpoint(ctx, job, cfg, progress, nil)
+}
+
+// ProcessFileWithCheckpoint converts a single file with optional checkpoint support.
+// If checkpoint is not nil, it will be called after each chunk completes with the chunk index.
+// The checkpoint callback can be used to persist progress for resume capability.
+func ProcessFileWithCheckpoint(ctx context.Context, job FileJob, cfg Config, progress func(current, total int), checkpoint func(chunkIdx int)) JobResult {
 	if err := ctx.Err(); err != nil {
 		return JobResult{Status: JobFailed, Err: err}
 	}
@@ -258,6 +265,10 @@ func ProcessFile(ctx context.Context, job FileJob, cfg Config, progress func(cur
 		}
 		if _, err := buf.Write(chunkAudio); err != nil {
 			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: err}
+		}
+		// Call checkpoint callback if provided
+		if checkpoint != nil {
+			checkpoint(idx)
 		}
 	}
 
