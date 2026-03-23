@@ -19,9 +19,7 @@ jobs:
           cache: true
 
       - name: Install staticcheck
-        run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
-          go install honnef.co/go/tools/cmd/staticcheck@latest
+        uses: staticcheck/install@v1
 
       - name: Format check
         run: make fmtcheck
