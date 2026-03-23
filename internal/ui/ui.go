@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -72,12 +74,13 @@ type VersionInfo struct {
 }
 
 type model struct {
-	state      appState
-	inputs     []textinput.Model
-	focusIndex int
-	overwrite  bool
-	message    string
-	err        error
+	state        appState
+	inputs       []textinput.Model
+	focusIndex   int
+	overwrite    bool
+	message      string
+	err          error
+	instructions textarea.Model
 
 	cfg          convert.Config
 	jobs         []convert.FileJob
@@ -102,6 +105,11 @@ type model struct {
 	// CLI mode - skip config screen and auto-quit on completion
 	cliMode bool
 	cliOpts *CLIOptions
+}
+
+// TUIConfig holds persisted configuration for the TUI.
+type TUIConfig struct {
+	Instructions string `json:"instructions"`
 }
 
 type taskStatus struct {
@@ -143,20 +151,36 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		}
 	}
 
+	// Load persisted config
+	tuiCfg := loadConfig()
+	defaultInstructions := envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening.")
+	instructionsVal := tuiCfg.Instructions
+	if instructionsVal == "" {
+		instructionsVal = defaultInstructions
+	}
+
+	taInstructions := textarea.New()
+	taInstructions.Placeholder = "e.g., Speak in a cheerful voice"
+	taInstructions.SetValue(instructionsVal)
+	taInstructions.SetWidth(60)
+	taInstructions.SetHeight(3)
+	taInstructions.ShowLineNumbers = false
+
 	spin := spinner.New()
 	spin.Spinner = spinner.Points
 
 	m := &model{
-		state:      stateConfig,
-		inputs:     inputs,
-		focusIndex: 0,
-		overwrite:  false,
-		message:    "",
-		err:        nil,
-		ctx:        context.Background(),
-		spin:       spin,
-		tasks:      make(map[string]taskStatus),
-		version:    v,
+		state:        stateConfig,
+		inputs:       inputs,
+		focusIndex:   0,
+		overwrite:    false,
+		message:      "",
+		err:          nil,
+		instructions: taInstructions,
+		ctx:          context.Background(),
+		spin:         spin,
+		tasks:        make(map[string]taskStatus),
+		version:      v,
 	}
 
 	// CLI mode: pre-fill inputs and mark for auto-start
@@ -179,6 +203,38 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func configPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	dir := filepath.Join(home, ".markloud")
+	_ = os.MkdirAll(dir, 0o755)
+	return filepath.Join(dir, "config.json")
+}
+
+func loadConfig() TUIConfig {
+	path := configPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TUIConfig{}
+	}
+	var cfg TUIConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return TUIConfig{}
+	}
+	return cfg
+}
+
+func saveConfig(cfg TUIConfig) error {
+	path := configPath()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
 func (m *model) Init() tea.Cmd {
 	if m.cliMode {
 		return m.startConversionCmd()
@@ -193,6 +249,10 @@ func (m *model) startConversionCmd() tea.Cmd {
 	if voice == "" {
 		voice = "alloy"
 	}
+	instructions := strings.TrimSpace(m.instructions.Value())
+	if instructions == "" {
+		instructions = "Speak clearly for podcast listening."
+	}
 
 	cfg := convert.Config{
 		Root:           root,
@@ -202,10 +262,13 @@ func (m *model) startConversionCmd() tea.Cmd {
 		ResponseFormat: "aac",
 		Speed:          1.0,
 		Overwrite:      m.overwrite,
-		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
+		Instructions:   instructions,
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		Pattern:        "*.md",
 	}
+
+	// Save instructions to config for next run
+	saveConfig(TUIConfig{Instructions: instructions})
 
 	return prepareConversionCmd(cfg)
 }
@@ -324,17 +387,27 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "tab", "shift+tab", "up", "down":
-			m.focusIndex = nextFocus(msg.String(), m.focusIndex, len(m.inputs))
-			for i := range m.inputs {
-				if i == m.focusIndex {
-					m.inputs[i].Focus()
-					m.inputs[i].PromptStyle = focusedStyle
-					m.inputs[i].TextStyle = focusedStyle
-				} else {
+			m.focusIndex = nextFocus(msg.String(), m.focusIndex, len(m.inputs)+1) // +1 for textarea
+			if m.focusIndex < len(m.inputs) {
+				m.instructions.Blur()
+				for i := range m.inputs {
+					if i == m.focusIndex {
+						m.inputs[i].Focus()
+						m.inputs[i].PromptStyle = focusedStyle
+						m.inputs[i].TextStyle = focusedStyle
+					} else {
+						m.inputs[i].Blur()
+						m.inputs[i].PromptStyle = noStyle
+						m.inputs[i].TextStyle = noStyle
+					}
+				}
+			} else {
+				for i := range m.inputs {
 					m.inputs[i].Blur()
 					m.inputs[i].PromptStyle = noStyle
 					m.inputs[i].TextStyle = noStyle
 				}
+				m.instructions.Focus()
 			}
 			return m, nil
 		case "o":
@@ -382,6 +455,9 @@ func (m *model) updateInputs(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputs[i], cmd = m.inputs[i].Update(msg)
 		cmds = append(cmds, cmd)
 	}
+	var taCmd tea.Cmd
+	m.instructions, taCmd = m.instructions.Update(msg)
+	cmds = append(cmds, taCmd)
 	return m, tea.Batch(cmds...)
 }
 
@@ -408,6 +484,10 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 	if voice == "" {
 		voice = "alloy"
 	}
+	instructions := strings.TrimSpace(m.instructions.Value())
+	if instructions == "" {
+		instructions = "Speak clearly for podcast listening."
+	}
 
 	cwd, _ := os.Getwd()
 	logPath := filepath.Join(cwd, "logs", "markloud_errors.log")
@@ -427,10 +507,13 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 		ResponseFormat: "aac",
 		Speed:          1.0,
 		Overwrite:      m.overwrite,
-		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
+		Instructions:   instructions,
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		Pattern:        "*.md",
 	}
+
+	// Save instructions to config for next run
+	saveConfig(TUIConfig{Instructions: instructions})
 
 	m.err = nil
 	m.message = "Preparing files…"
@@ -556,6 +639,8 @@ func (m *model) viewConfig() string {
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Output directory"), m.inputs[1].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Voice"), m.inputs[2].View()),
+		labelStyle.Render("Instructions"),
+		m.instructions.View(),
 		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite existing [o]:"), boolBadge(m.overwrite)),
 	}
 
@@ -566,7 +651,7 @@ func (m *model) viewConfig() string {
 		rows = append(rows, dimStyle.Render(m.message))
 	}
 
-	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
+	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit · ctrl+d to clear instructions"))
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }
