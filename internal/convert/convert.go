@@ -27,6 +27,7 @@ type Config struct {
 	Instructions   string
 	APIKey         string
 	Pattern        string
+	SplitOnHeading bool
 }
 
 // FileJob describes one markdown file to convert.
@@ -34,6 +35,16 @@ type FileJob struct {
 	AbsPath  string
 	RelPath  string
 	DestPath string
+	// Heading is set when SplitOnHeading is enabled and this job represents a heading section.
+	Heading *HeadingInfo
+}
+
+// HeadingInfo contains information about a heading section.
+type HeadingInfo struct {
+	Text       string // Original heading text
+	Slug       string // Sanitized filename component
+	Level      int    // Heading level (1 for #, 2 for ##, etc.)
+	ParentSlug string // Slug of parent heading (for nested headings)
 }
 
 type JobOutcome string
@@ -74,12 +85,14 @@ func SetTTSClient(c TTSClient) {
 }
 
 var (
-	codeFenceRe    = regexp.MustCompile("(?s)```.*?```")
-	inlineCodeRe   = regexp.MustCompile("`([^`]*)`")
-	headingRe      = regexp.MustCompile(`(?m)^#+\s*`)
-	bulletRe       = regexp.MustCompile(`(?m)^[>-]\s*`)
-	linkRe         = regexp.MustCompile(`\[((?:[^\]]|\\])+)]\([^)]+\)`)
-	multiNewlineRe = regexp.MustCompile(`\n{3,}`)
+	codeFenceRe       = regexp.MustCompile("(?s)```.*?```")
+	inlineCodeRe      = regexp.MustCompile("`([^`]*)`")
+	headingRe         = regexp.MustCompile(`(?m)^#+\s*`)
+	bulletRe          = regexp.MustCompile(`(?m)^[>-]\s*`)
+	linkRe            = regexp.MustCompile(`\[((?:[^\]]|\\])+)]\([^)]+\)`)
+	multiNewlineRe    = regexp.MustCompile(`\n{3,}`)
+	headingFullRe     = regexp.MustCompile(`(?m)^(#+)(\s+)(.+)$`)
+	invalidFilenameRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 )
 
 // StripMarkdown removes light Markdown syntax for cleaner TTS output.
@@ -91,6 +104,106 @@ func StripMarkdown(md string) string {
 	md = linkRe.ReplaceAllString(md, "$1")
 	md = multiNewlineRe.ReplaceAllString(md, "\n\n")
 	return strings.TrimSpace(md)
+}
+
+// heading represents a parsed markdown heading.
+type heading struct {
+	level     int
+	text      string
+	lineStart int
+	lineEnd   int
+}
+
+// extractHeadings finds all headings in markdown and returns their text and positions.
+func extractHeadings(md string) []heading {
+	var headings []heading
+	matches := headingFullRe.FindAllStringSubmatchIndex(md, -1)
+	for _, match := range matches {
+		if len(match) < 8 {
+			continue
+		}
+		level := len(md[match[2]:match[3]])
+		text := md[match[6]:match[7]]
+		lineStart := strings.Count(md[:match[0]], "\n")
+		headings = append(headings, heading{
+			level:     level,
+			text:      strings.TrimSpace(text),
+			lineStart: lineStart,
+		})
+	}
+	// Set lineEnd for each heading (start of next heading or end of file)
+	for i := range headings {
+		if i+1 < len(headings) {
+			headings[i].lineEnd = headings[i+1].lineStart
+		} else {
+			headings[i].lineEnd = strings.Count(md, "\n")
+		}
+	}
+	return headings
+}
+
+// sanitizeFilename converts heading text to a valid filename component.
+func sanitizeFilename(text string) string {
+	// Convert to lowercase
+	text = strings.ToLower(text)
+	// Replace spaces with hyphens
+	text = invalidFilenameRe.ReplaceAllString(text, "-")
+	// Collapse multiple hyphens
+	for strings.Contains(text, "--") {
+		text = strings.ReplaceAll(text, "--", "-")
+	}
+	// Trim hyphens from ends
+	text = strings.Trim(text, "-")
+	return text
+}
+
+// splitByHeadings splits markdown content into sections based on headings.
+func splitByHeadings(md string, topLevelOnly bool) []string {
+	headings := extractHeadings(md)
+	if len(headings) == 0 {
+		return nil
+	}
+
+	lines := strings.Split(md, "\n")
+	var sections []string
+	var currentSection []string
+	currentLevel := 0
+
+	for i, line := range lines {
+		// Check if this line is a heading
+		isHeading := false
+		var h heading
+		for _, heading := range headings {
+			if heading.lineStart == i {
+				isHeading = true
+				h = heading
+				break
+			}
+		}
+
+		if isHeading {
+			// Save current section if it has content
+			if len(currentSection) > 0 {
+				sections = append(sections, strings.Join(currentSection, "\n"))
+				currentSection = nil
+			}
+			currentLevel = h.level
+			// Skip the heading line itself, but include content under it
+			continue
+		}
+
+		if topLevelOnly && currentLevel > 1 {
+			continue
+		}
+		currentSection = append(currentSection, line)
+	}
+
+	// Don't forget the last section
+	if len(currentSection) > 0 {
+		sections = append(sections, strings.Join(currentSection, "\n"))
+	}
+
+	return sections
 }
 
 // ChunkText splits text into roughly maxChars-sized chunks at paragraph/sentence boundaries.
@@ -168,7 +281,7 @@ func ChunkText(text string, maxChars int) []string {
 }
 
 // CollectMarkdownFiles returns a list of jobs for matching markdown files.
-func CollectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]FileJob, error) {
+func CollectMarkdownFiles(root, outDir, pattern, responseFormat string, splitOnHeading bool) ([]FileJob, error) {
 	if pattern == "" {
 		pattern = "*.md"
 	}
@@ -194,6 +307,16 @@ func CollectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]FileJ
 		if err != nil {
 			return err
 		}
+
+		if splitOnHeading {
+			headingJobs, err := collectHeadingJobs(path, rel, outDir, responseFormat)
+			if err != nil {
+				return err
+			}
+			jobs = append(jobs, headingJobs...)
+			return nil
+		}
+
 		ext := filepath.Ext(rel)
 		destRel := strings.TrimSuffix(rel, ext) + "." + responseFormat
 		destPath := filepath.Join(outDir, destRel)
@@ -205,6 +328,109 @@ func CollectMarkdownFiles(root, outDir, pattern, responseFormat string) ([]FileJ
 		return nil
 	})
 	return jobs, err
+}
+
+// collectHeadingJobs creates FileJobs for each heading section in a markdown file.
+func collectHeadingJobs(absPath, relPath, outDir, responseFormat string) ([]FileJob, error) {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, err
+	}
+
+	headings := extractHeadings(string(data))
+	if len(headings) == 0 {
+		// No headings, create a single job with the original filename
+		ext := filepath.Ext(relPath)
+		destRel := strings.TrimSuffix(relPath, ext) + "." + responseFormat
+		destPath := filepath.Join(outDir, destRel)
+		return []FileJob{{
+			AbsPath:  absPath,
+			RelPath:  relPath,
+			DestPath: destPath,
+		}}, nil
+	}
+
+	// Use a map to track slugs and handle duplicates
+	slugCounts := make(map[string]int)
+	usedSlugs := make(map[string]bool)
+
+	// Build heading jobs with slug tracking
+	var headingInfos []HeadingInfo
+	for _, h := range headings {
+		slug := sanitizeFilename(h.text)
+
+		// Handle duplicate slugs by appending numeric suffix
+		if usedSlugs[slug] {
+			slugCounts[slug]++
+			slug = fmt.Sprintf("%s-%d", slug, slugCounts[slug])
+		}
+		usedSlugs[slug] = true
+
+		headingInfos = append(headingInfos, HeadingInfo{
+			Text:  h.text,
+			Slug:  slug,
+			Level: h.level,
+		})
+	}
+
+	// Build the heading tree to find parent slugs
+	buildHeadingTree(headingInfos)
+
+	// Create jobs for each heading
+	var jobs []FileJob
+	baseDir := filepath.Dir(relPath)
+	baseName := strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
+
+	for i := range headings {
+		var destRel string
+		parentSlug := headingInfos[i].ParentSlug
+
+		if parentSlug != "" {
+			// Nested heading: parentSlug__slug.aac
+			destRel = filepath.Join(baseDir, fmt.Sprintf("%s__%s.%s", parentSlug, headingInfos[i].Slug, responseFormat))
+		} else {
+			// Top-level heading: slug.aac
+			destRel = filepath.Join(baseDir, fmt.Sprintf("%s.%s", headingInfos[i].Slug, responseFormat))
+		}
+
+		// If baseDir is not empty and we have a nested structure, we need to include the base filename
+		if baseDir != "." && parentSlug == "" {
+			// For top-level headings in subdirectory files, prepend directory context
+			destRel = filepath.Join(baseDir, fmt.Sprintf("%s__%s.%s", baseName, headingInfos[i].Slug, responseFormat))
+		}
+
+		destPath := filepath.Join(outDir, destRel)
+
+		jobs = append(jobs, FileJob{
+			AbsPath:  absPath,
+			RelPath:  relPath,
+			DestPath: destPath,
+			Heading:  &headingInfos[i],
+		})
+	}
+
+	return jobs, nil
+}
+
+// buildHeadingTree updates ParentSlug for nested headings.
+func buildHeadingTree(headings []HeadingInfo) {
+	if len(headings) == 0 {
+		return
+	}
+
+	for i, h := range headings {
+		if h.Level == 1 {
+			continue // No parent for top-level headings
+		}
+
+		// Find the nearest parent heading (previous heading with lower level)
+		for j := i - 1; j >= 0; j-- {
+			if headings[j].Level < h.Level {
+				headings[i].ParentSlug = headings[j].Slug
+				break
+			}
+		}
+	}
 }
 
 // ProcessFile converts a single file using the configured TTS client.
@@ -223,7 +449,15 @@ func ProcessFile(ctx context.Context, job FileJob, cfg Config, progress func(cur
 	if err != nil {
 		return JobResult{Status: JobFailed, Err: err}
 	}
-	plain := StripMarkdown(string(data))
+
+	mdContent := string(data)
+
+	// If this job represents a heading section, extract just that section
+	if job.Heading != nil {
+		mdContent = extractSectionForHeading(mdContent, job.Heading.Text, job.Heading.Level)
+	}
+
+	plain := StripMarkdown(mdContent)
 	if strings.TrimSpace(plain) == "" {
 		return JobResult{Status: JobEmpty}
 	}
@@ -266,6 +500,40 @@ func ProcessFile(ctx context.Context, job FileJob, cfg Config, progress func(cur
 	}
 
 	return JobResult{Status: JobDone, Chunks: len(chunks)}
+}
+
+// extractSectionForHeading extracts the markdown content under a specific heading.
+func extractSectionForHeading(md, headingText string, headingLevel int) string {
+	lines := strings.Split(md, "\n")
+	var sectionLines []string
+	inSection := false
+	currentLevel := 0
+
+	for _, line := range lines {
+		// Check if this line is the target heading
+		matched := headingFullRe.FindStringSubmatch(line)
+		if matched != nil {
+			level := len(matched[1])
+			text := strings.TrimSpace(matched[3])
+
+			if text == headingText && level == headingLevel {
+				inSection = true
+				currentLevel = level
+				continue
+			}
+
+			// If we find another heading at same or lower level, we've left our section
+			if inSection && level <= currentLevel {
+				break
+			}
+		}
+
+		if inSection {
+			sectionLines = append(sectionLines, line)
+		}
+	}
+
+	return strings.Join(sectionLines, "\n")
 }
 
 func (c *openAIClient) Synthesize(ctx context.Context, cfg Config, chunk string) ([]byte, error) {
