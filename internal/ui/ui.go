@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/markloud/markloud/internal/config"
 	"github.com/markloud/markloud/internal/convert"
 )
 
@@ -62,6 +64,7 @@ type CLIOptions struct {
 	InputDir  string
 	OutputDir string
 	Voice     string
+	Speed     float64
 	Overwrite bool
 }
 
@@ -75,6 +78,7 @@ type model struct {
 	state      appState
 	inputs     []textinput.Model
 	focusIndex int
+	speed      float64
 	overwrite  bool
 	message    string
 	err        error
@@ -121,6 +125,12 @@ func Run(opts *CLIOptions, v VersionInfo) error {
 }
 
 func initialModel(opts *CLIOptions, v VersionInfo) *model {
+	// Load persisted config for speed
+	persistedSpeed := config.DefaultSpeed
+	if cfg, err := config.Load(); err == nil {
+		persistedSpeed = cfg.Speed
+	}
+
 	tiRoot := textinput.New()
 	tiRoot.Placeholder = "./notes"
 	tiRoot.SetValue(".")
@@ -134,7 +144,11 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 	tiVoice.Placeholder = "alloy"
 	tiVoice.SetValue(envOr("OPENAI_TTS_VOICE", "alloy"))
 
-	inputs := []textinput.Model{tiRoot, tiOut, tiVoice}
+	tiSpeed := textinput.New()
+	tiSpeed.Placeholder = "1.0"
+	tiSpeed.SetValue(fmt.Sprintf("%.2f", persistedSpeed))
+
+	inputs := []textinput.Model{tiRoot, tiOut, tiVoice, tiSpeed}
 	for i := range inputs {
 		if i == 0 {
 			inputs[i].Focus()
@@ -150,6 +164,7 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		state:      stateConfig,
 		inputs:     inputs,
 		focusIndex: 0,
+		speed:      persistedSpeed,
 		overwrite:  false,
 		message:    "",
 		err:        nil,
@@ -166,6 +181,8 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		m.inputs[0].SetValue(opts.InputDir)
 		m.inputs[1].SetValue(opts.OutputDir)
 		m.inputs[2].SetValue(opts.Voice)
+		m.inputs[3].SetValue(fmt.Sprintf("%.2f", opts.Speed))
+		m.speed = opts.Speed
 		m.overwrite = opts.Overwrite
 	}
 
@@ -177,6 +194,25 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func (m *model) parseSpeed() float64 {
+	speedStr := strings.TrimSpace(m.inputs[3].Value())
+	if speedStr == "" {
+		return 1.0
+	}
+	speed, err := strconv.ParseFloat(speedStr, 64)
+	if err != nil {
+		return 1.0
+	}
+	return speed
+}
+
+func validateSpeed(speed float64) error {
+	if speed < 0.25 || speed > 4.0 {
+		return fmt.Errorf("speed must be between 0.25 and 4.0, got %.2f", speed)
+	}
+	return nil
 }
 
 func (m *model) Init() tea.Cmd {
@@ -194,13 +230,23 @@ func (m *model) startConversionCmd() tea.Cmd {
 		voice = "alloy"
 	}
 
+	speed := m.parseSpeed()
+	if err := validateSpeed(speed); err != nil {
+		m.err = err
+		m.state = stateError
+		return tea.Tick(time.Second, func(time.Time) tea.Msg { return tea.Quit() })
+	}
+
+	// Persist speed to config file
+	_ = config.Save(&config.Config{Speed: speed})
+
 	cfg := convert.Config{
 		Root:           root,
 		Out:            out,
 		Voice:          voice,
 		Model:          "tts-1-hd-1106",
 		ResponseFormat: "aac",
-		Speed:          1.0,
+		Speed:          speed,
 		Overwrite:      m.overwrite,
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
@@ -409,6 +455,16 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 		voice = "alloy"
 	}
 
+	speed := m.parseSpeed()
+	if err := validateSpeed(speed); err != nil {
+		m.err = err
+		m.state = stateConfig
+		return m, nil
+	}
+
+	// Persist speed to config file
+	_ = config.Save(&config.Config{Speed: speed})
+
 	cwd, _ := os.Getwd()
 	logPath := filepath.Join(cwd, "logs", "markloud_errors.log")
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
@@ -425,7 +481,7 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 		Voice:          voice,
 		Model:          "tts-1-hd-1106",
 		ResponseFormat: "aac",
-		Speed:          1.0,
+		Speed:          speed,
 		Overwrite:      m.overwrite,
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
@@ -549,6 +605,10 @@ func (m *model) versionLabel() string {
 }
 
 func (m *model) viewConfig() string {
+	speedVal := m.inputs[3].Value()
+	if speedVal == "" {
+		speedVal = "1.0"
+	}
 	rows := []string{
 		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → AAC (OpenAI)", m.versionLabel())),
 		fmt.Sprintf("%s %s", labelStyle.Render("API key:"), presentMissing(os.Getenv("OPENAI_API_KEY"))),
@@ -556,6 +616,7 @@ func (m *model) viewConfig() string {
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Output directory"), m.inputs[1].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Voice"), m.inputs[2].View()),
+		fmt.Sprintf("%s\n%s", labelStyle.Render("Speed (0.25-4.0)"), m.inputs[3].View()),
 		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite existing [o]:"), boolBadge(m.overwrite)),
 	}
 
