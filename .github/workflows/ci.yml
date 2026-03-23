@@ -19,7 +19,8 @@ jobs:
           cache: true
 
       - name: Install linters
-        run: GOTOOLCHAIN=local go install honnef.co/go/tools/cmd/staticcheck@latest
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/dominikh/go-tools/master/install.sh | sh -s -- -b $(go env GOPATH)/bin latest
 
       - name: Format check
         run: make fmtcheck
