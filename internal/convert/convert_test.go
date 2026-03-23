@@ -67,7 +67,7 @@ func TestCollectMarkdownFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	jobs, err := CollectMarkdownFiles(root, filepath.Join(root, "out"), "*.md", "aac")
+	jobs, err := CollectMarkdownFiles(root, filepath.Join(root, "out"), "*.md", "aac", false)
 	if err != nil {
 		t.Fatalf("CollectMarkdownFiles error: %v", err)
 	}
@@ -136,5 +136,177 @@ func TestProcessFileUsesTTSClient(t *testing.T) {
 	}
 	if string(data) != "AUDIO" {
 		t.Fatalf("unexpected audio data %q", string(data))
+	}
+}
+
+func TestExtractHeadings(t *testing.T) {
+	md := `# Introduction
+
+Some intro content.
+
+# Getting Started
+
+## Installation
+
+Install steps.
+
+## Configuration
+
+Config steps.
+
+# FAQ`
+
+	headings := extractHeadings(md)
+	if len(headings) != 5 {
+		t.Fatalf("expected 5 headings, got %d", len(headings))
+	}
+
+	// Check first heading
+	if headings[0].text != "Introduction" || headings[0].level != 1 {
+		t.Fatalf("first heading: got %q (level %d), want %q (level %d)", headings[0].text, headings[0].level, "Introduction", 1)
+	}
+
+	// Check nested heading
+	if headings[1].text != "Getting Started" || headings[1].level != 1 {
+		t.Fatalf("second heading: got %q (level %d), want %q (level %d)", headings[1].text, headings[1].level, "Getting Started", 1)
+	}
+
+	if headings[2].text != "Installation" || headings[2].level != 2 {
+		t.Fatalf("third heading: got %q (level %d), want %q (level %d)", headings[2].text, headings[2].level, "Installation", 2)
+	}
+}
+
+func TestSanitizeFilename(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Hello World", "hello-world"},
+		{"  Spaces  ", "spaces"},
+		{"Special!@#$%^&*()", "special"},
+		{"multiple   spaces", "multiple-spaces"},
+		{"already-clean", "already-clean"},
+		{"UPPERCASE", "uppercase"},
+		{"mixCase123", "mixcase123"},
+		{"with_underscores", "with_underscores"},
+		{"with-dashes", "with-dashes"},
+	}
+
+	for _, tc := range tests {
+		got := sanitizeFilename(tc.input)
+		if got != tc.expected {
+			t.Errorf("sanitizeFilename(%q) = %q, want %q", tc.input, got, tc.expected)
+		}
+	}
+}
+
+func TestSplitByHeadings(t *testing.T) {
+	md := `# Intro
+
+Intro content.
+
+# Getting Started
+
+## Install
+
+Install content.
+
+## Config
+
+Config content.
+
+# Outro
+
+Outro content.`
+
+	// Test top-level only
+	sections := splitByHeadings(md, true)
+	if len(sections) != 3 {
+		t.Fatalf("expected 3 sections (top-level only), got %d", len(sections))
+	}
+
+	// Test all levels
+	sections = splitByHeadings(md, false)
+	if len(sections) != 5 {
+		t.Fatalf("expected 5 sections (all levels), got %d", len(sections))
+	}
+}
+
+func TestCollectMarkdownFilesWithSplitOnHeading(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "docs")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	src := filepath.Join(sub, "note.md")
+	md := `# Introduction
+
+Intro content.
+
+# Getting Started
+
+## Installation
+
+Install content.`
+	if err := os.WriteFile(src, []byte(md), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without split on heading - should get 1 job
+	jobs, err := CollectMarkdownFiles(root, filepath.Join(root, "out"), "*.md", "aac", false)
+	if err != nil {
+		t.Fatalf("CollectMarkdownFiles error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job without split, got %d", len(jobs))
+	}
+
+	// With split on heading - should get 3 jobs (Introduction, Getting Started, Installation)
+	jobs, err = CollectMarkdownFiles(root, filepath.Join(root, "out"), "*.md", "aac", true)
+	if err != nil {
+		t.Fatalf("CollectMarkdownFiles error: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 jobs with split, got %d", len(jobs))
+	}
+
+	// Check that jobs have Heading info set
+	if jobs[0].Heading == nil || jobs[1].Heading == nil || jobs[2].Heading == nil {
+		t.Fatal("expected Heading info to be set for split jobs")
+	}
+	if jobs[0].Heading.Text != "Introduction" {
+		t.Errorf("first job heading: got %q, want %q", jobs[0].Heading.Text, "Introduction")
+	}
+	if jobs[1].Heading.Text != "Getting Started" {
+		t.Errorf("second job heading: got %q, want %q", jobs[1].Heading.Text, "Getting Started")
+	}
+	if jobs[2].Heading.Text != "Installation" {
+		t.Errorf("third job heading: got %q, want %q", jobs[2].Heading.Text, "Installation")
+	}
+
+	// Check nested heading has correct parent
+	if jobs[2].Heading.ParentSlug != "getting-started" {
+		t.Errorf("nested heading parent slug: got %q, want %q", jobs[2].Heading.ParentSlug, "getting-started")
+	}
+}
+
+func TestCollectMarkdownFilesNoHeadings(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "note.md")
+	if err := os.WriteFile(src, []byte("Just plain content without any headings."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// With split on heading but no headings - should still get 1 job
+	jobs, err := CollectMarkdownFiles(root, filepath.Join(root, "out"), "*.md", "aac", true)
+	if err != nil {
+		t.Fatalf("CollectMarkdownFiles error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job for file without headings, got %d", len(jobs))
+	}
+	if jobs[0].Heading != nil {
+		t.Error("expected Heading to be nil for file without headings")
 	}
 }

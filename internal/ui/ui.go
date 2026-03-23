@@ -59,10 +59,11 @@ type chunkMsg struct {
 type allDoneMsg struct{}
 
 type CLIOptions struct {
-	InputDir  string
-	OutputDir string
-	Voice     string
-	Overwrite bool
+	InputDir       string
+	OutputDir      string
+	Voice          string
+	Overwrite      bool
+	SplitOnHeading bool
 }
 
 type VersionInfo struct {
@@ -72,12 +73,13 @@ type VersionInfo struct {
 }
 
 type model struct {
-	state      appState
-	inputs     []textinput.Model
-	focusIndex int
-	overwrite  bool
-	message    string
-	err        error
+	state          appState
+	inputs         []textinput.Model
+	focusIndex     int
+	overwrite      bool
+	splitOnHeading bool
+	message        string
+	err            error
 
 	cfg          convert.Config
 	jobs         []convert.FileJob
@@ -147,16 +149,17 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 	spin.Spinner = spinner.Points
 
 	m := &model{
-		state:      stateConfig,
-		inputs:     inputs,
-		focusIndex: 0,
-		overwrite:  false,
-		message:    "",
-		err:        nil,
-		ctx:        context.Background(),
-		spin:       spin,
-		tasks:      make(map[string]taskStatus),
-		version:    v,
+		state:          stateConfig,
+		inputs:         inputs,
+		focusIndex:     0,
+		overwrite:      false,
+		splitOnHeading: false,
+		message:        "",
+		err:            nil,
+		ctx:            context.Background(),
+		spin:           spin,
+		tasks:          make(map[string]taskStatus),
+		version:        v,
 	}
 
 	// CLI mode: pre-fill inputs and mark for auto-start
@@ -167,6 +170,7 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		m.inputs[1].SetValue(opts.OutputDir)
 		m.inputs[2].SetValue(opts.Voice)
 		m.overwrite = opts.Overwrite
+		m.splitOnHeading = opts.SplitOnHeading
 	}
 
 	return m
@@ -205,6 +209,7 @@ func (m *model) startConversionCmd() tea.Cmd {
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		Pattern:        "*.md",
+		SplitOnHeading: m.splitOnHeading,
 	}
 
 	return prepareConversionCmd(cfg)
@@ -340,6 +345,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "o":
 			m.overwrite = !m.overwrite
 			return m, nil
+		case "s":
+			m.splitOnHeading = !m.splitOnHeading
+			return m, nil
 		case "enter":
 			return m.startConversion()
 		default:
@@ -430,6 +438,7 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		Pattern:        "*.md",
+		SplitOnHeading: m.splitOnHeading,
 	}
 
 	m.err = nil
@@ -448,7 +457,7 @@ func prepareConversionCmd(cfg convert.Config) tea.Cmd {
 		if err != nil || !info.IsDir() {
 			return prepareFailedMsg{fmt.Errorf("input directory not found: %s", cfg.Root)}
 		}
-		jobs, err := convert.CollectMarkdownFiles(cfg.Root, cfg.Out, cfg.Pattern, cfg.ResponseFormat)
+		jobs, err := convert.CollectMarkdownFiles(cfg.Root, cfg.Out, cfg.Pattern, cfg.ResponseFormat, cfg.SplitOnHeading)
 		if err != nil {
 			return prepareFailedMsg{err}
 		}
@@ -557,6 +566,7 @@ func (m *model) viewConfig() string {
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Output directory"), m.inputs[1].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Voice"), m.inputs[2].View()),
 		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite existing [o]:"), boolBadge(m.overwrite)),
+		fmt.Sprintf("%s %s", labelStyle.Render("Split on heading [s]:"), boolBadge(m.splitOnHeading)),
 	}
 
 	if m.err != nil {
@@ -566,7 +576,7 @@ func (m *model) viewConfig() string {
 		rows = append(rows, dimStyle.Render(m.message))
 	}
 
-	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
+	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o toggle overwrite · s toggle split · q to quit"))
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }

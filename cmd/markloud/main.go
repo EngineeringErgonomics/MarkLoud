@@ -23,6 +23,7 @@ func main() {
 	outputDir := flag.String("o", "", "Output directory for audio files")
 	voice := flag.String("voice", getenv("OPENAI_TTS_VOICE", "alloy"), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
 	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
+	splitOnHeading := flag.Bool("split-on-heading", false, "Split audio at heading boundaries")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -37,10 +38,11 @@ func main() {
 			*outputDir = "./audio_out"
 		}
 		opts = &ui.CLIOptions{
-			InputDir:  *inputDir,
-			OutputDir: *outputDir,
-			Voice:     *voice,
-			Overwrite: *overwrite,
+			InputDir:       *inputDir,
+			OutputDir:      *outputDir,
+			Voice:          *voice,
+			Overwrite:      *overwrite,
+			SplitOnHeading: *splitOnHeading,
 		}
 	}
 
