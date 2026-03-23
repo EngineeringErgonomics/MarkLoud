@@ -15,6 +15,15 @@ import (
 	"time"
 )
 
+// Provider identifies the TTS backend.
+type Provider string
+
+const (
+	ProviderOpenAI Provider = "openai"
+	ProviderAzure  Provider = "azure"
+	ProviderCohere Provider = "cohere"
+)
+
 // Config holds inputs for a conversion run.
 type Config struct {
 	Root           string
@@ -27,6 +36,16 @@ type Config struct {
 	Instructions   string
 	APIKey         string
 	Pattern        string
+
+	// Provider selects which TTS backend to use.
+	Provider Provider
+
+	// Azure-specific config
+	AzureKey    string
+	AzureRegion string
+
+	// Cohere-specific config
+	CohereEndpoint string
 }
 
 // FileJob describes one markdown file to convert.
@@ -59,12 +78,46 @@ type TTSClient interface {
 
 type openAIClient struct {
 	httpClient *http.Client
+	endpoint   string
+}
+
+type azureClient struct {
+	httpClient *http.Client
+	endpoint   string
+	region     string
+}
+
+type cohereClient struct {
+	httpClient *http.Client
+	endpoint   string
 }
 
 var (
-	defaultHTTPClient           = &http.Client{Timeout: 90 * time.Second}
-	ttsClient         TTSClient = &openAIClient{httpClient: defaultHTTPClient}
+	defaultHTTPClient = &http.Client{Timeout: 90 * time.Second}
+	ttsClient         TTSClient // nil means use NewTTSClient(cfg)
 )
+
+// NewTTSClient creates a TTS client for the given provider based on the config.
+// If provider is empty, defaults to OpenAI.
+func NewTTSClient(cfg Config) TTSClient {
+	switch cfg.Provider {
+	case ProviderAzure:
+		endpoint := cfg.AzureRegion
+		if endpoint == "" {
+			endpoint = "eastus"
+		}
+		return &azureClient{httpClient: defaultHTTPClient, endpoint: endpoint}
+	case ProviderCohere:
+		endpoint := cfg.CohereEndpoint
+		if endpoint == "" {
+			endpoint = "https://api.cohere.ai/v1/audio/speech"
+		}
+		return &cohereClient{httpClient: defaultHTTPClient, endpoint: endpoint}
+	default:
+		// Default to OpenAI for backwards compatibility
+		return &openAIClient{httpClient: defaultHTTPClient, endpoint: "https://api.openai.com/v1/audio/speech"}
+	}
+}
 
 // SetTTSClient overrides the global TTS client (used in tests).
 func SetTTSClient(c TTSClient) {
@@ -242,6 +295,13 @@ func ProcessFile(ctx context.Context, job FileJob, cfg Config, progress func(cur
 		progress(0, totalChunks)
 	}
 	var buf bytes.Buffer
+
+	// Use the global ttsClient if set (e.g., by tests), otherwise create one based on config
+	client := ttsClient
+	if client == nil {
+		client = NewTTSClient(cfg)
+	}
+
 	for idx, chunk := range chunks {
 		if err := ctx.Err(); err != nil {
 			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: err}
@@ -249,10 +309,10 @@ func ProcessFile(ctx context.Context, job FileJob, cfg Config, progress func(cur
 		if progress != nil {
 			progress(idx+1, totalChunks)
 		}
-		if ttsClient == nil {
+		if client == nil {
 			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: errors.New("tts client not configured")}
 		}
-		chunkAudio, err := ttsClient.Synthesize(ctx, cfg, chunk)
+		chunkAudio, err := client.Synthesize(ctx, cfg, chunk)
 		if err != nil {
 			return JobResult{Status: JobFailed, Chunks: totalChunks, Err: err}
 		}
@@ -274,6 +334,9 @@ func (c *openAIClient) Synthesize(ctx context.Context, cfg Config, chunk string)
 	}
 	if c.httpClient == nil {
 		c.httpClient = defaultHTTPClient
+	}
+	if c.endpoint == "" {
+		c.endpoint = "https://api.openai.com/v1/audio/speech"
 	}
 
 	payload := map[string]any{
@@ -301,7 +364,105 @@ func (c *openAIClient) Synthesize(ctx context.Context, cfg Config, chunk string)
 		}
 
 		var buf bytes.Buffer
-		if err := doTTSRequest(ctx, c.httpClient, cfg.APIKey, body, &buf); err != nil {
+		if err := doTTSRequest(ctx, c.httpClient, c.endpoint, cfg.APIKey, body, &buf); err != nil {
+			lastErr = err
+			var apiErr *apiError
+			if errors.As(err, &apiErr) && apiErr.retryable {
+				continue
+			}
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("unknown TTS error")
+}
+
+func (c *azureClient) Synthesize(ctx context.Context, cfg Config, chunk string) ([]byte, error) {
+	if c.region == "" {
+		c.region = "eastus"
+	}
+	if c.httpClient == nil {
+		c.httpClient = defaultHTTPClient
+	}
+
+	// Azure Cognitive Services TTS uses a different endpoint format
+	endpoint := fmt.Sprintf("https://%s.tts.speech.microsoft.com/cognitiveservices/v1", c.region)
+
+	payload := map[string]any{
+		"input":        chunk,
+		"voice":        cfg.Voice,
+		"format":       "audio-24khz-48kbitrate-mono-mp3",
+		"outputFormat": "audio-24khz-48kbitrate-mono-mp3",
+	}
+	if cfg.Speed > 0 && cfg.Speed != 1.0 {
+		payload["rate"] = fmt.Sprintf("%+d%%", int((cfg.Speed-1)*100))
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt*attempt) * 300 * time.Millisecond)
+		}
+
+		var buf bytes.Buffer
+		if err := doAzureTTSRequest(ctx, c.httpClient, endpoint, cfg.APIKey, body, &buf); err != nil {
+			lastErr = err
+			var apiErr *apiError
+			if errors.As(err, &apiErr) && apiErr.retryable {
+				continue
+			}
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("unknown TTS error")
+}
+
+func (c *cohereClient) Synthesize(ctx context.Context, cfg Config, chunk string) ([]byte, error) {
+	if cfg.APIKey == "" {
+		return nil, errors.New("COHERE_API_KEY is missing")
+	}
+	if c.httpClient == nil {
+		c.httpClient = defaultHTTPClient
+	}
+	if c.endpoint == "" {
+		c.endpoint = "https://api.cohere.ai/v1/audio/speech"
+	}
+
+	payload := map[string]any{
+		"model":         cfg.Model,
+		"input":         chunk,
+		"voice":         cfg.Voice,
+		"output_format": cfg.ResponseFormat,
+	}
+	if cfg.Speed > 0 && cfg.Speed != 1.0 {
+		payload["speed"] = cfg.Speed
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt*attempt) * 300 * time.Millisecond)
+		}
+
+		var buf bytes.Buffer
+		if err := doTTSRequest(ctx, c.httpClient, c.endpoint, cfg.APIKey, body, &buf); err != nil {
 			lastErr = err
 			var apiErr *apiError
 			if errors.As(err, &apiErr) && apiErr.retryable {
@@ -327,13 +488,38 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("%s: %s", e.status, e.message)
 }
 
-func doTTSRequest(ctx context.Context, client *http.Client, apiKey string, body []byte, w io.Writer) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/audio/speech", bytes.NewReader(body))
+func doTTSRequest(ctx context.Context, client *http.Client, endpoint, apiKey string, body []byte, w io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		retryable := resp.StatusCode == 429 || resp.StatusCode >= 500
+		return &apiError{status: resp.Status, message: strings.TrimSpace(string(snippet)), retryable: retryable}
+	}
+
+	_, err = io.Copy(w, resp.Body)
+	return err
+}
+
+func doAzureTTSRequest(ctx context.Context, client *http.Client, endpoint, apiKey string, body []byte, w io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/ssml+xml")
+	req.Header.Set("Authorization", apiKey)
+	req.Header.Set("X-Microsoft-OutputFormat", "audio-24khz-48kbitrate-mono-mp3")
 
 	resp, err := client.Do(req)
 	if err != nil {
