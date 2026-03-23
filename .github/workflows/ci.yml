@@ -18,14 +18,19 @@ jobs:
           go-version: '1.24.x'
           cache: true
 
+      - name: Install staticcheck
+        run: |
+          export PATH=$PATH:$(go env GOPATH)/bin
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+
       - name: Format check
         run: make fmtcheck
 
       - name: Vet
         run: make vet
 
-      # - name: Lint
-      #   run: /tmp/staticcheck_linux_amd64 ./...
+      - name: Lint
+        run: make lint
 
       - name: Test
         run: make test
