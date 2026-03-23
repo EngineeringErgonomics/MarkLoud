@@ -28,6 +28,9 @@ const (
 	stateError
 )
 
+// Valid audio formats supported by OpenAI TTS API.
+var validFormats = []string{"aac", "mp3", "opus", "flac"}
+
 type summaryCounts struct {
 	Done    int
 	Skipped int
@@ -62,6 +65,7 @@ type CLIOptions struct {
 	InputDir  string
 	OutputDir string
 	Voice     string
+	Format    string
 	Overwrite bool
 }
 
@@ -76,6 +80,7 @@ type model struct {
 	inputs     []textinput.Model
 	focusIndex int
 	overwrite  bool
+	format     string
 	message    string
 	err        error
 
@@ -151,6 +156,7 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		inputs:     inputs,
 		focusIndex: 0,
 		overwrite:  false,
+		format:     "aac",
 		message:    "",
 		err:        nil,
 		ctx:        context.Background(),
@@ -167,6 +173,9 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		m.inputs[1].SetValue(opts.OutputDir)
 		m.inputs[2].SetValue(opts.Voice)
 		m.overwrite = opts.Overwrite
+		if opts.Format != "" {
+			m.format = opts.Format
+		}
 	}
 
 	return m
@@ -199,7 +208,7 @@ func (m *model) startConversionCmd() tea.Cmd {
 		Out:            out,
 		Voice:          voice,
 		Model:          "tts-1-hd-1106",
-		ResponseFormat: "aac",
+		ResponseFormat: m.format,
 		Speed:          1.0,
 		Overwrite:      m.overwrite,
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
@@ -340,6 +349,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "o":
 			m.overwrite = !m.overwrite
 			return m, nil
+		case "f":
+			m.format = nextFormat(m.format)
+			return m, nil
 		case "enter":
 			return m.startConversion()
 		default:
@@ -401,6 +413,15 @@ func nextFocus(key string, current, total int) int {
 	return current
 }
 
+func nextFormat(current string) string {
+	for i, f := range validFormats {
+		if f == current {
+			return validFormats[(i+1)%len(validFormats)]
+		}
+	}
+	return validFormats[0]
+}
+
 func (m *model) startConversion() (tea.Model, tea.Cmd) {
 	root := strings.TrimSpace(m.inputs[0].Value())
 	out := strings.TrimSpace(m.inputs[1].Value())
@@ -424,7 +445,7 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 		Out:            out,
 		Voice:          voice,
 		Model:          "tts-1-hd-1106",
-		ResponseFormat: "aac",
+		ResponseFormat: m.format,
 		Speed:          1.0,
 		Overwrite:      m.overwrite,
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
@@ -549,14 +570,16 @@ func (m *model) versionLabel() string {
 }
 
 func (m *model) viewConfig() string {
+	formatLabel := formatBadge(m.format)
 	rows := []string{
-		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → AAC (OpenAI)", m.versionLabel())),
+		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → Audio (OpenAI)", m.versionLabel())),
 		fmt.Sprintf("%s %s", labelStyle.Render("API key:"), presentMissing(os.Getenv("OPENAI_API_KEY"))),
 		"",
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Output directory"), m.inputs[1].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Voice"), m.inputs[2].View()),
-		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite existing [o]:"), boolBadge(m.overwrite)),
+		fmt.Sprintf("%s %s  %s", labelStyle.Render("Format [f]:"), formatLabel, dimStyle.Render("(mp3, opus, flac, aac)")),
+		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite [o]:"), boolBadge(m.overwrite)),
 	}
 
 	if m.err != nil {
@@ -566,7 +589,7 @@ func (m *model) viewConfig() string {
 		rows = append(rows, dimStyle.Render(m.message))
 	}
 
-	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
+	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · f to cycle format · o to toggle overwrite · q to quit"))
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }
@@ -583,6 +606,10 @@ func boolBadge(v bool) string {
 		return successStyle.Render("ON")
 	}
 	return dimStyle.Render("off")
+}
+
+func formatBadge(format string) string {
+	return emphStyle.Render(strings.ToUpper(format))
 }
 
 func (m *model) renderActive() []string {
