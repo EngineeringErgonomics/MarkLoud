@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/markloud/markloud/internal/config"
 	"github.com/markloud/markloud/internal/convert"
 )
 
@@ -102,6 +104,10 @@ type model struct {
 	// CLI mode - skip config screen and auto-quit on completion
 	cliMode bool
 	cliOpts *CLIOptions
+
+	// Speed and instructions as separate fields for persistence
+	speed        float64
+	instructions string
 }
 
 type taskStatus struct {
@@ -121,20 +127,31 @@ func Run(opts *CLIOptions, v VersionInfo) error {
 }
 
 func initialModel(opts *CLIOptions, v VersionInfo) *model {
+	// Load persisted config
+	cfg, _ := config.Load()
+
 	tiRoot := textinput.New()
 	tiRoot.Placeholder = "./notes"
-	tiRoot.SetValue(".")
+	tiRoot.SetValue(cfg.InputDir)
 	tiRoot.Focus()
 
 	tiOut := textinput.New()
 	tiOut.Placeholder = "./audio_out"
-	tiOut.SetValue("./audio_out")
+	tiOut.SetValue(cfg.OutputDir)
 
 	tiVoice := textinput.New()
 	tiVoice.Placeholder = "alloy"
-	tiVoice.SetValue(envOr("OPENAI_TTS_VOICE", "alloy"))
+	tiVoice.SetValue(envOr("OPENAI_TTS_VOICE", cfg.Voice))
 
-	inputs := []textinput.Model{tiRoot, tiOut, tiVoice}
+	tiSpeed := textinput.New()
+	tiSpeed.Placeholder = "1.0"
+	tiSpeed.SetValue(strconv.FormatFloat(cfg.Speed, 'f', 1, 64))
+
+	tiInstructions := textinput.New()
+	tiInstructions.Placeholder = "Speak clearly for podcast listening."
+	tiInstructions.SetValue(cfg.Instructions)
+
+	inputs := []textinput.Model{tiRoot, tiOut, tiVoice, tiSpeed, tiInstructions}
 	for i := range inputs {
 		if i == 0 {
 			inputs[i].Focus()
@@ -147,25 +164,33 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 	spin.Spinner = spinner.Points
 
 	m := &model{
-		state:      stateConfig,
-		inputs:     inputs,
-		focusIndex: 0,
-		overwrite:  false,
-		message:    "",
-		err:        nil,
-		ctx:        context.Background(),
-		spin:       spin,
-		tasks:      make(map[string]taskStatus),
-		version:    v,
+		state:        stateConfig,
+		inputs:       inputs,
+		focusIndex:   0,
+		overwrite:    cfg.Overwrite,
+		message:      "",
+		err:          nil,
+		ctx:          context.Background(),
+		spin:         spin,
+		tasks:        make(map[string]taskStatus),
+		version:      v,
+		speed:        cfg.Speed,
+		instructions: cfg.Instructions,
 	}
 
 	// CLI mode: pre-fill inputs and mark for auto-start
 	if opts != nil {
 		m.cliMode = true
 		m.cliOpts = opts
-		m.inputs[0].SetValue(opts.InputDir)
-		m.inputs[1].SetValue(opts.OutputDir)
-		m.inputs[2].SetValue(opts.Voice)
+		if opts.InputDir != "" {
+			m.inputs[0].SetValue(opts.InputDir)
+		}
+		if opts.OutputDir != "" {
+			m.inputs[1].SetValue(opts.OutputDir)
+		}
+		if opts.Voice != "" {
+			m.inputs[2].SetValue(opts.Voice)
+		}
 		m.overwrite = opts.Overwrite
 	}
 
@@ -177,6 +202,17 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func parseSpeed(s string) float64 {
+	if s == "" {
+		return 1.0
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f <= 0 {
+		return 1.0
+	}
+	return f
 }
 
 func (m *model) Init() tea.Cmd {
@@ -193,6 +229,11 @@ func (m *model) startConversionCmd() tea.Cmd {
 	if voice == "" {
 		voice = "alloy"
 	}
+	speed := parseSpeed(strings.TrimSpace(m.inputs[3].Value()))
+	instructions := strings.TrimSpace(m.inputs[4].Value())
+	if instructions == "" {
+		instructions = "Speak clearly for podcast listening."
+	}
 
 	cfg := convert.Config{
 		Root:           root,
@@ -200,12 +241,26 @@ func (m *model) startConversionCmd() tea.Cmd {
 		Voice:          voice,
 		Model:          "tts-1-hd-1106",
 		ResponseFormat: "aac",
-		Speed:          1.0,
+		Speed:          speed,
 		Overwrite:      m.overwrite,
-		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
+		Instructions:   instructions,
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		Pattern:        "*.md",
 	}
+
+	// Save config for future runs
+	m.speed = speed
+	m.instructions = instructions
+	go func() {
+		_ = config.Save(config.Config{
+			InputDir:     root,
+			OutputDir:    out,
+			Voice:        voice,
+			Speed:        speed,
+			Instructions: instructions,
+			Overwrite:    m.overwrite,
+		})
+	}()
 
 	return prepareConversionCmd(cfg)
 }
@@ -408,6 +463,11 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 	if voice == "" {
 		voice = "alloy"
 	}
+	speed := parseSpeed(strings.TrimSpace(m.inputs[3].Value()))
+	instructions := strings.TrimSpace(m.inputs[4].Value())
+	if instructions == "" {
+		instructions = "Speak clearly for podcast listening."
+	}
 
 	cwd, _ := os.Getwd()
 	logPath := filepath.Join(cwd, "logs", "markloud_errors.log")
@@ -425,12 +485,26 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 		Voice:          voice,
 		Model:          "tts-1-hd-1106",
 		ResponseFormat: "aac",
-		Speed:          1.0,
+		Speed:          speed,
 		Overwrite:      m.overwrite,
-		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
+		Instructions:   instructions,
 		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		Pattern:        "*.md",
 	}
+
+	// Save config for future runs
+	m.speed = speed
+	m.instructions = instructions
+	go func() {
+		_ = config.Save(config.Config{
+			InputDir:     root,
+			OutputDir:    out,
+			Voice:        voice,
+			Speed:        speed,
+			Instructions: instructions,
+			Overwrite:    m.overwrite,
+		})
+	}()
 
 	m.err = nil
 	m.message = "Preparing files…"
@@ -556,6 +630,8 @@ func (m *model) viewConfig() string {
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Output directory"), m.inputs[1].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Voice"), m.inputs[2].View()),
+		fmt.Sprintf("%s\n%s", labelStyle.Render("Speed"), m.inputs[3].View()),
+		fmt.Sprintf("%s\n%s", labelStyle.Render("Instructions"), m.inputs[4].View()),
 		fmt.Sprintf("%s %s", labelStyle.Render("Overwrite existing [o]:"), boolBadge(m.overwrite)),
 	}
 

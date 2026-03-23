@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/joho/godotenv"
+	"github.com/markloud/markloud/internal/config"
 	"github.com/markloud/markloud/internal/ui"
 )
 
@@ -19,11 +20,15 @@ var (
 func main() {
 	_ = godotenv.Load()
 
+	// Load persisted config for defaults
+	cfg, _ := config.Load()
+
 	inputDir := flag.String("i", "", "Input directory containing markdown files")
 	outputDir := flag.String("o", "", "Output directory for audio files")
-	voice := flag.String("voice", getenv("OPENAI_TTS_VOICE", "alloy"), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
+	voice := flag.String("voice", getenv("OPENAI_TTS_VOICE", cfg.Voice), "TTS voice (alloy, echo, fable, onyx, nova, shimmer)")
 	overwrite := flag.Bool("overwrite", false, "Overwrite existing audio files")
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	useDefaults := flag.Bool("defaults", false, "Skip prompts and use config file values")
 	flag.Parse()
 
 	if *showVersion {
@@ -32,9 +37,16 @@ func main() {
 	}
 
 	var opts *ui.CLIOptions
-	if *inputDir != "" {
+	if *inputDir != "" || *useDefaults {
 		if *outputDir == "" {
-			*outputDir = "./audio_out"
+			if *inputDir != "" {
+				*outputDir = "./audio_out"
+			} else {
+				*outputDir = cfg.OutputDir
+			}
+		}
+		if *inputDir == "" {
+			*inputDir = cfg.InputDir
 		}
 		opts = &ui.CLIOptions{
 			InputDir:  *inputDir,
