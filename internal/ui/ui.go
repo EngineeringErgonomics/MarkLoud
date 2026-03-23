@@ -62,6 +62,7 @@ type CLIOptions struct {
 	InputDir  string
 	OutputDir string
 	Voice     string
+	Provider  string
 	Overwrite bool
 }
 
@@ -76,6 +77,7 @@ type model struct {
 	inputs     []textinput.Model
 	focusIndex int
 	overwrite  bool
+	provider   string
 	message    string
 	err        error
 
@@ -151,6 +153,7 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		inputs:     inputs,
 		focusIndex: 0,
 		overwrite:  false,
+		provider:   envOr("MARKLOUD_PROVIDER", "openai"),
 		message:    "",
 		err:        nil,
 		ctx:        context.Background(),
@@ -167,6 +170,9 @@ func initialModel(opts *CLIOptions, v VersionInfo) *model {
 		m.inputs[1].SetValue(opts.OutputDir)
 		m.inputs[2].SetValue(opts.Voice)
 		m.overwrite = opts.Overwrite
+		if opts.Provider != "" {
+			m.provider = opts.Provider
+		}
 	}
 
 	return m
@@ -177,6 +183,41 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func nextProvider(current string) string {
+	switch current {
+	case "openai":
+		return "azure"
+	case "azure":
+		return "cohere"
+	case "cohere":
+		return "openai"
+	default:
+		return "openai"
+	}
+}
+
+func modelForProvider(provider string) string {
+	switch provider {
+	case "azure":
+		return "azure-tts"
+	case "cohere":
+		return "cohere-tts"
+	default:
+		return "tts-1-hd-1106"
+	}
+}
+
+func apiKeyForProvider(provider string) string {
+	switch provider {
+	case "azure":
+		return os.Getenv("AZURE_TTS_KEY")
+	case "cohere":
+		return os.Getenv("COHERE_API_KEY")
+	default:
+		return os.Getenv("OPENAI_API_KEY")
+	}
 }
 
 func (m *model) Init() tea.Cmd {
@@ -198,13 +239,25 @@ func (m *model) startConversionCmd() tea.Cmd {
 		Root:           root,
 		Out:            out,
 		Voice:          voice,
-		Model:          "tts-1-hd-1106",
+		Model:          modelForProvider(m.provider),
 		ResponseFormat: "aac",
 		Speed:          1.0,
 		Overwrite:      m.overwrite,
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
-		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		Provider:       convert.Provider(m.provider),
 		Pattern:        "*.md",
+	}
+
+	// Set provider-specific API key and config
+	switch cfg.Provider {
+	case convert.ProviderOpenAI:
+		cfg.APIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	case convert.ProviderAzure:
+		cfg.APIKey = strings.TrimSpace(os.Getenv("AZURE_TTS_KEY"))
+		cfg.AzureRegion = strings.TrimSpace(envOr("AZURE_TTS_REGION", "eastus"))
+	case convert.ProviderCohere:
+		cfg.APIKey = strings.TrimSpace(os.Getenv("COHERE_API_KEY"))
+		cfg.CohereEndpoint = strings.TrimSpace(os.Getenv("COHERE_TTS_ENDPOINT"))
 	}
 
 	return prepareConversionCmd(cfg)
@@ -340,6 +393,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "o":
 			m.overwrite = !m.overwrite
 			return m, nil
+		case "p":
+			m.provider = nextProvider(m.provider)
+			return m, nil
 		case "enter":
 			return m.startConversion()
 		default:
@@ -423,13 +479,25 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 		Root:           root,
 		Out:            out,
 		Voice:          voice,
-		Model:          "tts-1-hd-1106",
+		Model:          modelForProvider(m.provider),
 		ResponseFormat: "aac",
 		Speed:          1.0,
 		Overwrite:      m.overwrite,
 		Instructions:   envOr("OPENAI_TTS_INSTRUCTIONS", "Speak clearly for podcast listening."),
-		APIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		Provider:       convert.Provider(m.provider),
 		Pattern:        "*.md",
+	}
+
+	// Set provider-specific API key and config
+	switch cfg.Provider {
+	case convert.ProviderOpenAI:
+		cfg.APIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	case convert.ProviderAzure:
+		cfg.APIKey = strings.TrimSpace(os.Getenv("AZURE_TTS_KEY"))
+		cfg.AzureRegion = strings.TrimSpace(envOr("AZURE_TTS_REGION", "eastus"))
+	case convert.ProviderCohere:
+		cfg.APIKey = strings.TrimSpace(os.Getenv("COHERE_API_KEY"))
+		cfg.CohereEndpoint = strings.TrimSpace(os.Getenv("COHERE_TTS_ENDPOINT"))
 	}
 
 	m.err = nil
@@ -442,7 +510,7 @@ func (m *model) startConversion() (tea.Model, tea.Cmd) {
 func prepareConversionCmd(cfg convert.Config) tea.Cmd {
 	return func() tea.Msg {
 		if cfg.APIKey == "" {
-			return prepareFailedMsg{errors.New("OPENAI_API_KEY is not set")}
+			return prepareFailedMsg{errors.New(apiKeyErrorForProvider(string(cfg.Provider)))}
 		}
 		info, err := os.Stat(cfg.Root)
 		if err != nil || !info.IsDir() {
@@ -456,6 +524,17 @@ func prepareConversionCmd(cfg convert.Config) tea.Cmd {
 			return prepareFailedMsg{fmt.Errorf("no markdown files matching %s", cfg.Pattern)}
 		}
 		return preparedMsg{cfg: cfg, jobs: jobs}
+	}
+}
+
+func apiKeyErrorForProvider(provider string) string {
+	switch provider {
+	case "azure":
+		return "AZURE_TTS_KEY is not set"
+	case "cohere":
+		return "COHERE_API_KEY is not set"
+	default:
+		return "OPENAI_API_KEY is not set"
 	}
 }
 
@@ -549,9 +628,15 @@ func (m *model) versionLabel() string {
 }
 
 func (m *model) viewConfig() string {
+	providerLabel := m.provider
+	if m.provider == "openai" {
+		providerLabel = providerLabel + " (default)"
+	}
+
 	rows := []string{
-		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → AAC (OpenAI)", m.versionLabel())),
-		fmt.Sprintf("%s %s", labelStyle.Render("API key:"), presentMissing(os.Getenv("OPENAI_API_KEY"))),
+		titleStyle.Render(fmt.Sprintf("%s ▸ Markdown → AAC", m.versionLabel())),
+		fmt.Sprintf("%s %s", labelStyle.Render("Provider [p]:"), emphStyle.Render(providerLabel)),
+		fmt.Sprintf("%s %s", labelStyle.Render("API key:"), presentMissing(apiKeyForProvider(m.provider))),
 		"",
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Input directory"), m.inputs[0].View()),
 		fmt.Sprintf("%s\n%s", labelStyle.Render("Output directory"), m.inputs[1].View()),
@@ -566,7 +651,7 @@ func (m *model) viewConfig() string {
 		rows = append(rows, dimStyle.Render(m.message))
 	}
 
-	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · q to quit"))
+	rows = append(rows, dimStyle.Render(m.versionLabel()+" · tab/shift+tab to move · enter to start · o to toggle overwrite · p to change provider · q to quit"))
 
 	return boxStyle.Width(76).Render(strings.Join(rows, "\n"))
 }
