@@ -21,7 +21,7 @@ jobs:
       - name: Install linters
         run: |
           curl -sL https://github.com/dominikh/go-tools/releases/latest/download/staticcheck_linux_amd64.tar.gz | tar xz -C /tmp
-          mv /tmp/staticcheck /tmp/staticcheck_linux_amd64
+          chmod +x /tmp/staticcheck_linux_amd64
 
       - name: Format check
         run: make fmtcheck
